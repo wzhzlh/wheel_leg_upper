@@ -1,0 +1,8 @@
+build/
+install/
+log/
+.cache/
+
+# Cursor / VS Code 本地索引数据库（体积巨大，切勿入库）
+.vscode/browse.vc.db*
+.vscode/ipch/

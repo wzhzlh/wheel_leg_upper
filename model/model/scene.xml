@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  MuJoCo 场景文件：地面 + 光照 + 机器人本体。
+  launch 里的 mjcf_path 参数指向本文件（而不是 wheel_leg.xml），
+  这样仿真里才有地面可以站立/滚动。
+-->
+<mujoco model="wheel_leg_scene">
+  <include file="wheel_leg.xml"/>
+
+  <statistic center="0 0 0.30" extent="0.9"/>
+
+  <visual>
+    <headlight diffuse="0.25 0.25 0.25" ambient="0.35 0.35 0.35" specular="0.1 0.1 0.1"/>
+    <rgba haze="0.15 0.25 0.35 1"/>
+    <global offwidth="1920" offheight="1080"/>
+  </visual>
+
+  <asset>
+    <texture type="skybox" builtin="gradient" rgb1="0.35 0.55 0.75" rgb2="0.05 0.08 0.1"
+             width="512" height="3072"/>
+    <texture type="2d" name="groundplane" builtin="checker" mark="edge"
+             rgb1="0.22 0.26 0.30" rgb2="0.13 0.16 0.19" markrgb="0.8 0.8 0.8"
+             width="300" height="300"/>
+    <material name="groundplane" texture="groundplane" texuniform="true"
+              texrepeat="5 5" reflectance="0.15"/>
+  </asset>
+
+  <worldbody>
+    <geom name="ground" type="plane" size="8 8 0.1" pos="0 0 0"
+          material="groundplane" friction="1.2 0.01 0.0001"/>
+    <light name="main_light" pos="0 0 4" dir="0 0 -1" directional="true"/>
+  </worldbody>
+</mujoco>

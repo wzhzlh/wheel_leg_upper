@@ -1,0 +1,183 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  双并腿轮足机器人 MuJoCo 模型（与 model/wheel_leg.urdf 一一对应）
+
+  外观按实机：橙色片状腿连杆 + 黑色机身 + 顶部黑色防护架 + 黑色蜂窝轮。
+
+  说明：
+    * 关节名、body 名、几何尺寸、质量均与 URDF 保持一致，
+      mujoco_ros2_control 通过“关节名”把 URDF 的 ros2_control 标签
+      映射到这里的 joint 上，名字写错会静默失去控制接口。
+    * base_link 带 <freejoint>，整机在仿真中是浮动的（可以倒、可以跑）。
+      URDF 无法描述浮动基座，因此 RViz 里 base_link 会被当作固定在世界原点，
+      真实位姿以 MuJoCo 窗口为准。
+    * 惯量由各 geom 的 mass + 形状自动合成，避免手写 diaginertia 的主轴排序问题；
+      同一 body 内各 geom 的 mass 之和等于 URDF 里该 link 的质量。
+    * 防护架、轮毂只做视觉（contype/conaffinity = 0），与 URDF 的 collision 声明一致。
+    * 执行器分两类：
+        position actuator -> mujoco_ros2_control 识别为 POSITION 接口（腿关节）
+        motor actuator    -> 识别为 EFFORT 接口（轮子）
+      注意 position actuator 不要加 kv，否则 biasprm[2] != 0，
+      不会被识别成 POSITION actuator，会退回插件内部的 PD 计算。
+-->
+<mujoco model="wheel_leg">
+  <compiler angle="radian" autolimits="true"/>
+
+  <option gravity="0 0 -9.81" integrator="implicitfast" cone="elliptic" impratio="10"/>
+
+  <default>
+    <geom friction="1.2 0.01 0.0001" contype="1" conaffinity="1" rgba="0.3 0.3 0.34 1"/>
+  </default>
+
+  <worldbody>
+    <!-- ==================== 机身（浮动基座） ==================== -->
+    <body name="base_link" pos="0 0 0.365">
+      <freejoint name="base_freejoint"/>
+
+      <!-- 主体：黑色电池/控制盒（0.24 x 0.20 x 0.10） -->
+      <geom name="base_geom" type="box" size="0.12 0.10 0.05" pos="0 0 0.07"
+            mass="0.85" rgba="0.07 0.07 0.08 1"/>
+
+      <!-- 顶部防护架：4 根立柱 -->
+      <geom name="post_fl" type="box" size="0.008 0.008 0.04" pos="0.09 0.07 0.16"
+            mass="0.02" rgba="0.07 0.07 0.08 1" contype="0" conaffinity="0"/>
+      <geom name="post_fr" type="box" size="0.008 0.008 0.04" pos="0.09 -0.07 0.16"
+            mass="0.02" rgba="0.07 0.07 0.08 1" contype="0" conaffinity="0"/>
+      <geom name="post_bl" type="box" size="0.008 0.008 0.04" pos="-0.09 0.07 0.16"
+            mass="0.02" rgba="0.07 0.07 0.08 1" contype="0" conaffinity="0"/>
+      <geom name="post_br" type="box" size="0.008 0.008 0.04" pos="-0.09 -0.07 0.16"
+            mass="0.02" rgba="0.07 0.07 0.08 1" contype="0" conaffinity="0"/>
+
+      <!-- 顶部防护架：前后横杆（沿 x） -->
+      <geom name="rail_top_y1" type="box" size="0.09 0.008 0.008" pos="0 0.07 0.20"
+            mass="0.0175" rgba="0.07 0.07 0.08 1" contype="0" conaffinity="0"/>
+      <geom name="rail_top_y2" type="box" size="0.09 0.008 0.008" pos="0 -0.07 0.20"
+            mass="0.0175" rgba="0.07 0.07 0.08 1" contype="0" conaffinity="0"/>
+
+      <!-- 顶部防护架：左右横杆（沿 y） -->
+      <geom name="rail_top_x1" type="box" size="0.008 0.07 0.008" pos="0.09 0 0.20"
+            mass="0.0175" rgba="0.07 0.07 0.08 1" contype="0" conaffinity="0"/>
+      <geom name="rail_top_x2" type="box" size="0.008 0.07 0.008" pos="-0.09 0 0.20"
+            mass="0.0175" rgba="0.07 0.07 0.08 1" contype="0" conaffinity="0"/>
+
+      <!-- IMU 安装点：与 URDF 的 imu_link 同位姿 -->
+      <body name="imu_link" pos="0 0 0.16">
+        <geom name="imu_geom" type="box" size="0.015 0.015 0.004" mass="0.01"
+              rgba="0.15 0.45 0.85 1" contype="0" conaffinity="0"/>
+        <site name="imu_site" pos="0 0 0" size="0.005"/>
+      </body>
+
+      <!-- ==================== 左腿 ==================== -->
+      <body name="leg_left_thigh" pos="0 0.10 0">
+        <joint name="leg_left_hip_joint" type="hinge" axis="0 1 0"
+               range="-1.30 1.30" damping="0.30"/>
+
+        <!-- 髋部橙色关节块 -->
+        <geom name="leg_left_hip_block" type="box" size="0.025 0.025 0.025" pos="0 0 -0.02"
+              mass="0.05" rgba="0.93 0.42 0.10 1"/>
+
+        <!-- 大腿：橙色片状连杆 -->
+        <geom name="leg_left_thigh_geom" type="box" size="0.0175 0.0225 0.065" pos="0 0 -0.075"
+              mass="0.30" rgba="0.93 0.42 0.10 1"/>
+
+        <body name="leg_left_shank" pos="0 0 -0.15">
+          <joint name="leg_left_knee_joint" type="hinge" axis="0 1 0"
+                 range="-2.60 0.10" damping="0.30"/>
+
+          <!-- 膝部橙色关节块 -->
+          <geom name="leg_left_knee_block" type="box" size="0.0225 0.025 0.0225" pos="0 0 -0.13"
+                mass="0.04" rgba="0.93 0.42 0.10 1"/>
+
+          <!-- 小腿：橙色片状连杆 -->
+          <geom name="leg_left_shank_geom" type="box" size="0.015 0.020 0.065" pos="0 0 -0.075"
+                mass="0.21" rgba="0.93 0.42 0.10 1"/>
+
+          <body name="wheel_left" pos="0 0 -0.15">
+            <joint name="wheel_left_joint" type="hinge" axis="0 1 0" damping="0.01"/>
+
+            <!-- 轮胎 -->
+            <geom name="wheel_left_geom" type="cylinder" size="0.065 0.0175" zaxis="0 1 0"
+                  mass="0.18" rgba="0.04 0.04 0.04 1" friction="1.6 0.02 0.0001"/>
+            <!-- 轮毂（纯视觉） -->
+            <geom name="wheel_left_hub" type="cylinder" size="0.045 0.019" zaxis="0 1 0"
+                  mass="0.02" rgba="0.55 0.55 0.58 1" contype="0" conaffinity="0"/>
+          </body>
+        </body>
+      </body>
+
+      <!-- ==================== 右腿 ==================== -->
+      <body name="leg_right_thigh" pos="0 -0.10 0">
+        <joint name="leg_right_hip_joint" type="hinge" axis="0 1 0"
+               range="-1.30 1.30" damping="0.30"/>
+
+        <geom name="leg_right_hip_block" type="box" size="0.025 0.025 0.025" pos="0 0 -0.02"
+              mass="0.05" rgba="0.93 0.42 0.10 1"/>
+
+        <geom name="leg_right_thigh_geom" type="box" size="0.0175 0.0225 0.065" pos="0 0 -0.075"
+              mass="0.30" rgba="0.93 0.42 0.10 1"/>
+
+        <body name="leg_right_shank" pos="0 0 -0.15">
+          <joint name="leg_right_knee_joint" type="hinge" axis="0 1 0"
+                 range="-2.60 0.10" damping="0.30"/>
+
+          <geom name="leg_right_knee_block" type="box" size="0.0225 0.025 0.0225" pos="0 0 -0.13"
+                mass="0.04" rgba="0.93 0.42 0.10 1"/>
+
+          <geom name="leg_right_shank_geom" type="box" size="0.015 0.020 0.065" pos="0 0 -0.075"
+                mass="0.21" rgba="0.93 0.42 0.10 1"/>
+
+          <body name="wheel_right" pos="0 0 -0.15">
+            <joint name="wheel_right_joint" type="hinge" axis="0 1 0" damping="0.01"/>
+
+            <geom name="wheel_right_geom" type="cylinder" size="0.065 0.0175" zaxis="0 1 0"
+                  mass="0.18" rgba="0.04 0.04 0.04 1" friction="1.6 0.02 0.0001"/>
+            <geom name="wheel_right_hub" type="cylinder" size="0.045 0.019" zaxis="0 1 0"
+                  mass="0.02" rgba="0.55 0.55 0.58 1" contype="0" conaffinity="0"/>
+          </body>
+        </body>
+      </body>
+    </body>
+  </worldbody>
+
+  <!-- 相邻连杆之间不做碰撞检测（腿片与关节块天然相交） -->
+  <contact>
+    <exclude body1="base_link" body2="leg_left_thigh"/>
+    <exclude body1="base_link" body2="leg_right_thigh"/>
+    <exclude body1="leg_left_thigh" body2="leg_left_shank"/>
+    <exclude body1="leg_right_thigh" body2="leg_right_shank"/>
+    <exclude body1="leg_left_shank" body2="wheel_left"/>
+    <exclude body1="leg_right_shank" body2="wheel_right"/>
+  </contact>
+
+  <actuator>
+    <!-- 腿关节：位置伺服，ctrl = 目标关节角 [rad] -->
+    <position name="leg_left_hip_act" joint="leg_left_hip_joint" kp="30"
+              ctrllimited="true" ctrlrange="-1.30 1.30"
+              forcelimited="true" forcerange="-12 12"/>
+    <position name="leg_left_knee_act" joint="leg_left_knee_joint" kp="30"
+              ctrllimited="true" ctrlrange="-2.60 0.10"
+              forcelimited="true" forcerange="-12 12"/>
+    <position name="leg_right_hip_act" joint="leg_right_hip_joint" kp="30"
+              ctrllimited="true" ctrlrange="-1.30 1.30"
+              forcelimited="true" forcerange="-12 12"/>
+    <position name="leg_right_knee_act" joint="leg_right_knee_joint" kp="30"
+              ctrllimited="true" ctrlrange="-2.60 0.10"
+              forcelimited="true" forcerange="-12 12"/>
+
+    <!-- 轮子：力矩直通，ctrl = 轮轴力矩 [N*m]，与 LQR 的 u 同一量纲 -->
+    <motor name="wheel_left_act" joint="wheel_left_joint" gear="1"
+           ctrllimited="true" ctrlrange="-3 3"/>
+    <motor name="wheel_right_act" joint="wheel_right_joint" gear="1"
+           ctrllimited="true" ctrlrange="-3 3"/>
+  </actuator>
+
+  <sensor>
+    <!-- 挂到 imu_site 上，插件会把它注册成 IMU（话题 <node>/imu） -->
+    <gyro name="imu_gyro" site="imu_site"/>
+    <accelerometer name="imu_accel" site="imu_site"/>
+
+    <!-- 机身世界位姿，可用于把仿真 odom 桥接给 leg_calc -->
+    <framepos name="base_link_pos" objtype="body" objname="base_link"/>
+    <framequat name="base_link_quat" objtype="body" objname="base_link"/>
+  </sensor>
+</mujoco>

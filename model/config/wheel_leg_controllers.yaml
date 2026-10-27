@@ -1,0 +1,42 @@
+# MuJoCo 仿真用 ros2_control 配置
+#
+# 分工：
+#   joint_state_broadcaster   -> /joint_states（6 个关节的 position/velocity/effort）
+#   leg_position_controller   -> /leg_position_controller/commands（Float64MultiArray，4 个腿关节目标角）
+#   wheel_effort_controller   -> /wheel_effort_controller/commands（Float64MultiArray，2 个轮子力矩）
+#
+# 力矩顺序与 URDF 的 ros2_control 声明顺序一致：
+#   wheel_effort_controller /commands = [wheel_left_joint, wheel_right_joint]
+#   leg_position_controller /commands = [leg_left_hip_joint, leg_left_knee_joint,
+#                                        leg_right_hip_joint, leg_right_knee_joint]
+
+controller_manager:
+  ros__parameters:
+    update_rate: 500  # Hz，与 launch 里的 simulation_frequency 对齐
+
+    joint_state_broadcaster:
+      type: joint_state_broadcaster/JointStateBroadcaster
+
+    leg_position_controller:
+      type: position_controllers/JointGroupPositionController
+
+    wheel_effort_controller:
+      type: effort_controllers/JointGroupEffortController
+
+# joint_state_broadcaster 不需要额外配置：
+# 六个驱动关节都在 URDF 的 <ros2_control> 里声明了 position/velocity/effort，
+# 广播器会自动全量发布到 /joint_states。
+
+leg_position_controller:
+  ros__parameters:
+    joints:
+      - leg_left_hip_joint
+      - leg_left_knee_joint
+      - leg_right_hip_joint
+      - leg_right_knee_joint
+
+wheel_effort_controller:
+  ros__parameters:
+    joints:
+      - wheel_left_joint
+      - wheel_right_joint

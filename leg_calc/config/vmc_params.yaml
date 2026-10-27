@@ -1,0 +1,37 @@
+leg_calc_vmc_controller:
+  ros__parameters:
+    # ---------------- 五杆几何（单位 m） ----------------
+    # 坐标系：原点 O 为近端髋，x 指向远端髋 D，y 竖直向下（与机械图一致）
+    #   A = O + l1*(cosα, sinα)      C = D + l4*(cosβ, sinβ)      |AB| = l2, |CB| = l3
+    l1: 0.10                # O→A 前摆臂
+    l2: 0.20                # A→B 前连杆
+    l3: 0.20                # C→B 后连杆
+    l4: 0.10                # D→C 后摆臂
+    l5: 0.10                # O→D 两髋间距
+    foot_branch: 1          # 正解装配：+1 足端在 A→C 连线下方（图中装配）
+    front_branch: 1         # 逆解装配：+1 前肘在 O→B 左侧
+    rear_branch: 1          # 逆解装配：+1 后肘在 D→B 右侧
+
+    # ---------------- 足端虚拟弹簧-阻尼 F = Kp(x_d-x) + Kd(ẋ_d-ẋ) ----------------
+    kp_x: 60.0              # 前后刚度 [N/m]
+    kp_y: 300.0             # 上下刚度 [N/m]：越大越"硬"，静态下垂 ≈ 单腿负载/kp_y
+    kd_x: 3.0               # 前后阻尼 [N·s/m]
+    kd_y: 12.0              # 上下阻尼 [N·s/m]
+    force_max_x: 40.0       # 足端力限幅 [N]，<=0 不限
+    force_max_y: 150.0
+
+    # ---------------- 足端目标（笛卡尔，单位 m / m·s^-1） ----------------
+    foot_target_x: 0.05     # 足端前后位置：默认在 O-D 中点正下方
+    foot_target_y: 0.30     # 足端上下位置：y 向下为正，即"腿长"
+    foot_vel_target_x: 0.0
+    foot_vel_target_y: 0.0
+
+    # ---------------- 输出与安全 ----------------
+    torque_max: 8.0         # 关节力矩限幅 [N·m]（RobStride 额定 12）
+    joint_torque_sign: [1.0, 1.0, 1.0, 1.0]  # 实测某关节力矩方向相反时置 -1
+    control_rate: 200.0     # 控制频率 [Hz]
+    joint_state_timeout: 0.2  # joint_states 超时后力矩置零 [s]
+    joint_states_topic: joint_states
+    joint_target_topic: joint_target
+    leg_joint_names: [leg_left_hip_joint, leg_left_knee_joint,
+                      leg_right_hip_joint, leg_right_knee_joint]

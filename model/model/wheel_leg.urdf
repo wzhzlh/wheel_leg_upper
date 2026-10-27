@@ -1,0 +1,497 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  双并腿轮足机器人（无 STL 版本，按实机外观用基本几何体搭建）
+
+  ============================ 建模约定 ============================
+  坐标系：x 向前、y 向左、z 向上（REP-103），长度单位 m，角度 rad。
+  外观取实机配色：橙色片状腿连杆 + 黑色机身 + 顶部黑色防护架 + 黑色蜂窝轮。
+
+  拓扑（左右对称，两条腿的髋关节同轴、在 y 方向并排）：
+
+      base_link（机身，仿真的浮动基座；含顶部防护架）
+        ├─ leg_left_hip_joint  (revolute, 轴 +y)
+        │    └─ leg_left_thigh  （橙色髋块 + 大腿片）
+        │         └─ leg_left_knee_joint (revolute, 轴 +y)
+        │              └─ leg_left_shank （橙色膝块 + 小腿片）
+        │                   └─ wheel_left_joint (continuous, 轴 +y)
+        │                        └─ wheel_left （黑胎 + 浅灰轮毂）
+        ├─ leg_right_hip_joint / ... （与左侧镜像）
+        └─ imu_link (fixed)
+
+  零位：所有关节角 = 0 时，大腿、小腿都竖直向下，轮心在髋轴正下方
+        0.15 + 0.15 = 0.30 m 处；整机直立时 base_link 离地
+        0.30 + 0.065 = 0.365 m。
+        实机静止时是屈膝姿态（膝约 -0.5 rad），仿真里保持零位竖直、
+        用位置指令摆出站姿，这样 q_hip/q_knee 与 LQR 的高度公式
+        h = l1*cos(q_hip) + l2*cos(q_hip + q_knee) + com_offset 直接对应。
+
+  关节命名与实机保持一致（见 leg_calc/config/lqr_params.yaml 的
+  leg_joint_names 与 usb_drive 的 wheel_joint_names）：
+      leg_left_hip_joint, leg_left_knee_joint,
+      leg_right_hip_joint, leg_right_knee_joint,
+      wheel_left_joint, wheel_right_joint
+
+  关键尺寸（与 lqr_params.yaml 对应）：
+      thigh = 0.15 m（l1）, shank = 0.15 m（l2）
+      wheel_radius = 0.065 m, wheel_separation = 0.20 m
+
+  质量分配（对照 LQR 的 cart-pole 等效参数）：
+      机身 1.00（含防护架 0.15）+ 腿 2×(0.35+0.25) = 2.20 kg ≈ pendulum_mass(2.5)
+      轮子 2×0.20 = 0.40 kg                                  ≈ cart_mass(1.2) 的一部分
+  惯量按各视觉几何体手算后合并（分块质量见下面各 link）。
+
+  说明：base_link 是根连杆且带惯量，robot_state_publisher 启动时会打印
+  “The root link base_link has an inertia specified in the URDF, but KDL
+  does not support a root link with an inertia”，属于预期告警，不影响使用。
+  这里没有像机械臂那样加 world 虚拟根，是为了将来能把 odom->base_link
+  的 TF 直接接到 base_link 上（浮动基座）。
+  =================================================================
+-->
+<robot name="wheel_leg">
+
+  <!-- ==================== ros2_control 硬件接口 ==================== -->
+  <!-- MuJoCo 仿真时由 mujoco_ros2_control/MujocoSystem 接管；
+       换到实机时把 plugin 换成真实硬件插件，关节名保持不变即可。 -->
+  <ros2_control name="wheel_leg_system" type="system">
+    <hardware>
+      <plugin>mujoco_ros2_control/MujocoSystem</plugin>
+    </hardware>
+
+    <!-- 腿关节：位置伺服（实机对应 RobStride 的 kp/kd 位置控制） -->
+    <joint name="leg_left_hip_joint">
+      <command_interface name="position"/>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+      <state_interface name="effort"/>
+    </joint>
+
+    <joint name="leg_left_knee_joint">
+      <command_interface name="position"/>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+      <state_interface name="effort"/>
+    </joint>
+
+    <joint name="leg_right_hip_joint">
+      <command_interface name="position"/>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+      <state_interface name="effort"/>
+    </joint>
+
+    <joint name="leg_right_knee_joint">
+      <command_interface name="position"/>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+      <state_interface name="effort"/>
+    </joint>
+
+    <!-- 轮关节：力矩控制（实机对应 M2006，当前固件为位置-速度串级） -->
+    <joint name="wheel_left_joint">
+      <command_interface name="effort"/>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+      <state_interface name="effort"/>
+    </joint>
+
+    <joint name="wheel_right_joint">
+      <command_interface name="effort"/>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+      <state_interface name="effort"/>
+    </joint>
+  </ros2_control>
+
+  <!-- 实机配色 -->
+  <material name="frame_black">
+    <color rgba="0.07 0.07 0.08 1.0"/>
+  </material>
+  <material name="leg_orange">
+    <color rgba="0.93 0.42 0.10 1.0"/>
+  </material>
+  <material name="tire_black">
+    <color rgba="0.04 0.04 0.04 1.0"/>
+  </material>
+  <material name="hub_gray">
+    <color rgba="0.55 0.55 0.58 1.0"/>
+  </material>
+  <material name="imu_blue">
+    <color rgba="0.15 0.45 0.85 1.0"/>
+  </material>
+
+  <!-- ==================== 机身（含顶部防护架） ==================== -->
+  <link name="base_link">
+    <inertial>
+      <origin xyz="0 0 0.075" rpy="0 0 0"/>
+      <mass value="1.0"/>
+      <inertia ixx="0.005100" ixy="0" ixz="0"
+               iyy="0.006360" iyz="0"
+               izz="0.007560"/>
+    </inertial>
+
+    <!-- 主体：黑色电池/控制盒 -->
+    <visual>
+      <origin xyz="0 0 0.07" rpy="0 0 0"/>
+      <geometry>
+        <box size="0.24 0.20 0.10"/>
+      </geometry>
+      <material name="frame_black"/>
+    </visual>
+
+    <!-- 顶部防护架：4 根立柱 -->
+    <visual>
+      <origin xyz="0.09 0.07 0.16" rpy="0 0 0"/>
+      <geometry>
+        <box size="0.016 0.016 0.08"/>
+      </geometry>
+      <material name="frame_black"/>
+    </visual>
+    <visual>
+      <origin xyz="0.09 -0.07 0.16" rpy="0 0 0"/>
+      <geometry>
+        <box size="0.016 0.016 0.08"/>
+      </geometry>
+      <material name="frame_black"/>
+    </visual>
+    <visual>
+      <origin xyz="-0.09 0.07 0.16" rpy="0 0 0"/>
+      <geometry>
+        <box size="0.016 0.016 0.08"/>
+      </geometry>
+      <material name="frame_black"/>
+    </visual>
+    <visual>
+      <origin xyz="-0.09 -0.07 0.16" rpy="0 0 0"/>
+      <geometry>
+        <box size="0.016 0.016 0.08"/>
+      </geometry>
+      <material name="frame_black"/>
+    </visual>
+
+    <!-- 顶部防护架：前后横杆（沿 x） -->
+    <visual>
+      <origin xyz="0 0.07 0.20" rpy="0 0 0"/>
+      <geometry>
+        <box size="0.18 0.016 0.016"/>
+      </geometry>
+      <material name="frame_black"/>
+    </visual>
+    <visual>
+      <origin xyz="0 -0.07 0.20" rpy="0 0 0"/>
+      <geometry>
+        <box size="0.18 0.016 0.016"/>
+      </geometry>
+      <material name="frame_black"/>
+    </visual>
+
+    <!-- 顶部防护架：左右横杆（沿 y） -->
+    <visual>
+      <origin xyz="0.09 0 0.20" rpy="0 0 0"/>
+      <geometry>
+        <box size="0.016 0.14 0.016"/>
+      </geometry>
+      <material name="frame_black"/>
+    </visual>
+    <visual>
+      <origin xyz="-0.09 0 0.20" rpy="0 0 0"/>
+      <geometry>
+        <box size="0.016 0.14 0.016"/>
+      </geometry>
+      <material name="frame_black"/>
+    </visual>
+
+    <!-- 碰撞体只保留主体盒子，防护架不参与碰撞 -->
+    <collision>
+      <origin xyz="0 0 0.07" rpy="0 0 0"/>
+      <geometry>
+        <box size="0.24 0.20 0.10"/>
+      </geometry>
+    </collision>
+  </link>
+
+  <!-- ==================== 左腿：大腿 ==================== -->
+  <link name="leg_left_thigh">
+    <inertial>
+      <origin xyz="0 0 -0.07" rpy="0 0 0"/>
+      <mass value="0.35"/>
+      <inertia ixx="0.000760" ixy="0" ixz="0"
+               iyy="0.000740" iyz="0"
+               izz="0.000230"/>
+    </inertial>
+
+    <!-- 髋部橙色关节块 -->
+    <visual>
+      <origin xyz="0 0 -0.02" rpy="0 0 0"/>
+      <geometry>
+        <box size="0.05 0.05 0.05"/>
+      </geometry>
+      <material name="leg_orange"/>
+    </visual>
+
+    <!-- 大腿：橙色片状连杆 -->
+    <visual>
+      <origin xyz="0 0 -0.075" rpy="0 0 0"/>
+      <geometry>
+        <box size="0.035 0.045 0.13"/>
+      </geometry>
+      <material name="leg_orange"/>
+    </visual>
+
+    <collision>
+      <origin xyz="0 0 -0.075" rpy="0 0 0"/>
+      <geometry>
+        <box size="0.035 0.045 0.15"/>
+      </geometry>
+    </collision>
+  </link>
+
+  <joint name="leg_left_hip_joint" type="revolute">
+    <origin xyz="0 0.10 0" rpy="0 0 0"/>
+    <parent link="base_link"/>
+    <child link="leg_left_thigh"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-1.30" upper="1.30" effort="12.0" velocity="8.0"/>
+  </joint>
+
+  <!-- ==================== 左腿：小腿 ==================== -->
+  <link name="leg_left_shank">
+    <inertial>
+      <origin xyz="0 0 -0.06" rpy="0 0 0"/>
+      <mass value="0.25"/>
+      <inertia ixx="0.000630" ixy="0" ixz="0"
+               iyy="0.000610" iyz="0"
+               izz="0.000060"/>
+    </inertial>
+
+    <!-- 膝部橙色关节块 -->
+    <visual>
+      <origin xyz="0 0 -0.13" rpy="0 0 0"/>
+      <geometry>
+        <box size="0.045 0.05 0.045"/>
+      </geometry>
+      <material name="leg_orange"/>
+    </visual>
+
+    <!-- 小腿：橙色片状连杆 -->
+    <visual>
+      <origin xyz="0 0 -0.075" rpy="0 0 0"/>
+      <geometry>
+        <box size="0.030 0.040 0.13"/>
+      </geometry>
+      <material name="leg_orange"/>
+    </visual>
+
+    <collision>
+      <origin xyz="0 0 -0.075" rpy="0 0 0"/>
+      <geometry>
+        <box size="0.030 0.040 0.15"/>
+      </geometry>
+    </collision>
+  </link>
+
+  <!-- 膝限位：[-2.60, 0.10]。负角为弯曲方向（小腿向后折），
+       与 MJCF 及 LQR 的 h = l1*cos(q_hip) + l2*cos(q_hip+q_knee) 约定一致。 -->
+  <joint name="leg_left_knee_joint" type="revolute">
+    <origin xyz="0 0 -0.15" rpy="0 0 0"/>
+    <parent link="leg_left_thigh"/>
+    <child link="leg_left_shank"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-2.60" upper="0.10" effort="12.0" velocity="8.0"/>
+  </joint>
+
+  <!-- ==================== 左轮 ==================== -->
+  <link name="wheel_left">
+    <inertial>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <mass value="0.20"/>
+      <inertia ixx="0.000220" ixy="0" ixz="0"
+               iyy="0.000400" iyz="0"
+               izz="0.000220"/>
+    </inertial>
+
+    <!-- 轮胎 -->
+    <visual>
+      <origin xyz="0 0 0" rpy="1.5707963 0 0"/>
+      <geometry>
+        <cylinder radius="0.065" length="0.035"/>
+      </geometry>
+      <material name="tire_black"/>
+    </visual>
+
+    <!-- 轮毂 -->
+    <visual>
+      <origin xyz="0 0 0" rpy="1.5707963 0 0"/>
+      <geometry>
+        <cylinder radius="0.045" length="0.038"/>
+      </geometry>
+      <material name="hub_gray"/>
+    </visual>
+
+    <collision>
+      <origin xyz="0 0 0" rpy="1.5707963 0 0"/>
+      <geometry>
+        <cylinder radius="0.065" length="0.035"/>
+      </geometry>
+    </collision>
+  </link>
+
+  <joint name="wheel_left_joint" type="continuous">
+    <origin xyz="0 0 -0.15" rpy="0 0 0"/>
+    <parent link="leg_left_shank"/>
+    <child link="wheel_left"/>
+    <axis xyz="0 1 0"/>
+    <limit effort="3.0" velocity="50.0"/>
+  </joint>
+
+  <!-- ==================== 右腿：大腿 ==================== -->
+  <link name="leg_right_thigh">
+    <inertial>
+      <origin xyz="0 0 -0.07" rpy="0 0 0"/>
+      <mass value="0.35"/>
+      <inertia ixx="0.000760" ixy="0" ixz="0"
+               iyy="0.000740" iyz="0"
+               izz="0.000230"/>
+    </inertial>
+
+    <visual>
+      <origin xyz="0 0 -0.02" rpy="0 0 0"/>
+      <geometry>
+        <box size="0.05 0.05 0.05"/>
+      </geometry>
+      <material name="leg_orange"/>
+    </visual>
+
+    <visual>
+      <origin xyz="0 0 -0.075" rpy="0 0 0"/>
+      <geometry>
+        <box size="0.035 0.045 0.13"/>
+      </geometry>
+      <material name="leg_orange"/>
+    </visual>
+
+    <collision>
+      <origin xyz="0 0 -0.075" rpy="0 0 0"/>
+      <geometry>
+        <box size="0.035 0.045 0.15"/>
+      </geometry>
+    </collision>
+  </link>
+
+  <joint name="leg_right_hip_joint" type="revolute">
+    <origin xyz="0 -0.10 0" rpy="0 0 0"/>
+    <parent link="base_link"/>
+    <child link="leg_right_thigh"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-1.30" upper="1.30" effort="12.0" velocity="8.0"/>
+  </joint>
+
+  <!-- ==================== 右腿：小腿 ==================== -->
+  <link name="leg_right_shank">
+    <inertial>
+      <origin xyz="0 0 -0.06" rpy="0 0 0"/>
+      <mass value="0.25"/>
+      <inertia ixx="0.000630" ixy="0" ixz="0"
+               iyy="0.000610" iyz="0"
+               izz="0.000060"/>
+    </inertial>
+
+    <visual>
+      <origin xyz="0 0 -0.13" rpy="0 0 0"/>
+      <geometry>
+        <box size="0.045 0.05 0.045"/>
+      </geometry>
+      <material name="leg_orange"/>
+    </visual>
+
+    <visual>
+      <origin xyz="0 0 -0.075" rpy="0 0 0"/>
+      <geometry>
+        <box size="0.030 0.040 0.13"/>
+      </geometry>
+      <material name="leg_orange"/>
+    </visual>
+
+    <collision>
+      <origin xyz="0 0 -0.075" rpy="0 0 0"/>
+      <geometry>
+        <box size="0.030 0.040 0.15"/>
+      </geometry>
+    </collision>
+  </link>
+
+  <joint name="leg_right_knee_joint" type="revolute">
+    <origin xyz="0 0 -0.15" rpy="0 0 0"/>
+    <parent link="leg_right_thigh"/>
+    <child link="leg_right_shank"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-2.60" upper="0.10" effort="12.0" velocity="8.0"/>
+  </joint>
+
+  <!-- ==================== 右轮 ==================== -->
+  <link name="wheel_right">
+    <inertial>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <mass value="0.20"/>
+      <inertia ixx="0.000220" ixy="0" ixz="0"
+               iyy="0.000400" iyz="0"
+               izz="0.000220"/>
+    </inertial>
+
+    <visual>
+      <origin xyz="0 0 0" rpy="1.5707963 0 0"/>
+      <geometry>
+        <cylinder radius="0.065" length="0.035"/>
+      </geometry>
+      <material name="tire_black"/>
+    </visual>
+
+    <visual>
+      <origin xyz="0 0 0" rpy="1.5707963 0 0"/>
+      <geometry>
+        <cylinder radius="0.045" length="0.038"/>
+      </geometry>
+      <material name="hub_gray"/>
+    </visual>
+
+    <collision>
+      <origin xyz="0 0 0" rpy="1.5707963 0 0"/>
+      <geometry>
+        <cylinder radius="0.065" length="0.035"/>
+      </geometry>
+    </collision>
+  </link>
+
+  <joint name="wheel_right_joint" type="continuous">
+    <origin xyz="0 0 -0.15" rpy="0 0 0"/>
+    <parent link="leg_right_shank"/>
+    <child link="wheel_right"/>
+    <axis xyz="0 1 0"/>
+    <limit effort="3.0" velocity="50.0"/>
+  </joint>
+
+  <!-- ==================== IMU ==================== -->
+  <!-- 放在防护架顶部，与实机 /imu/data 的 frame_id=imu_link 保持一致 -->
+  <link name="imu_link">
+    <inertial>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <mass value="0.01"/>
+      <inertia ixx="1e-06" ixy="0" ixz="0"
+               iyy="1e-06" iyz="0"
+               izz="1e-06"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <box size="0.03 0.03 0.008"/>
+      </geometry>
+      <material name="imu_blue"/>
+    </visual>
+  </link>
+
+  <joint name="imu_joint" type="fixed">
+    <origin xyz="0 0 0.16" rpy="0 0 0"/>
+    <parent link="base_link"/>
+    <child link="imu_link"/>
+  </joint>
+
+</robot>

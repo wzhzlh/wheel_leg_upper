@@ -1,0 +1,160 @@
+leg_control:
+  ros__parameters:
+    # ================= 500 Hz 统一控制环 =================
+    # 一个周期内顺序完成：状态快照 → 状态机 → Pitch LQR → 双 VMC → 轮子分配
+    control_rate: 500.0              # 控制环频率 [Hz]
+
+    # ---------------- 机器人物理参数 ----------------
+    # 以下数值全部由 src/model/model/wheel_leg.urdf 推导（home 姿态）。
+    # home 姿态取 MJCF keyframe "home"：两轮轴等高（差 0.15 mm）的站立零位；
+    # 注意 URDF 关节零位左右不对称，home 时右腿并非全零（rf1=-0.2259, rf2=0.3339），
+    # 直接用 q=0 会得到两轮高度差 13.6 mm 的错误姿态（大质量 base 的质心不受影响，
+    # 但轮轴高度会被算成 0.0254，h 偏大到 0.0895）。
+    cart_mass: 0.285                 # M：两轮质量之和 [kg]（lefoot 0.130114 + rifoot 0.155050）
+    pendulum_mass: 1.904             # m：腿 + 机身（摆杆）质量 [kg]（base 1.667452 + 4 曲柄 0.077208 + 4 连杆 0.159329）
+    com_length: 0.0834               # h：home 姿态摆杆质心到轮轴距离 [m]（URDF 合成质心 z 0.115454 − 轮轴 z 0.032089）
+    com_inertia: 0.00255             # I：摆杆绕自身质心 pitch 惯量 [kg·m²]（URDF 九连杆平行轴合成 2.545e-3）
+    gravity: 9.81                    # g：重力加速度 [m/s²]
+    wheel_radius: 0.030              # r：轮半径 [m]（STL 轮胎外缘 0.0299；URDF 轮轴 z 0.0321，base 原点比地面高约 2 mm）
+    wheel_inertia: 0.0000532         # Jw：两轮绕轮轴等效转动惯量 [kg·m²]（URDF izz 之和 2.339e-5 + 2.983e-5）
+    input_mode: wheel_torque         # 控制输入定义：wheel_torque（轮轴力矩，N·m）/ force（轮轴等效力，N）
+
+    # ---------------- LQR 权重与增益调度 ----------------
+    q_diag: [50.0, 500.0, 10.0, 1.0]  # 状态权重 Q 对角，顺序 [x, theta, x_dot, theta_dot]
+    r_weight: 1.0                    # 控制权重 R（1x1，标量）
+    gain_mode: quadratic             # 用常数增益（下面 k_coeffs 的常数项），避免 LQR 增益过大导致力矩常年饱和
+    k_coeffs: [                      # K_j(h) = c2_j·h² + c1_j·h + c0_j，4 行 x 3 列
+      0.0, 0.0, -1.18,               #   行 = [k_x, k_theta, k_x_dot, k_theta_dot]
+      0.0, 0.0, -4.52,               #   列 = [h² 系数, h 系数, 常数项]
+      0.0, 0.0, -1.16,               #   取 LQR 增益的 1/6：饱和点 θ≈0.089 rad、θ̇≈1.4 rad/s、x≈0.34 m
+      0.0, 0.0, -0.28
+    ]
+    # ---------------- 五杆足端 -> 质心高度：h = 足端_y + com_offset ----------------
+    thigh: 0.15                      # [参考] 串联模型大腿长度 l1 [m]（URDF 无双连杆串联腿，主链路已改用五杆，仅单测用）
+    shank: 0.15                      # [参考] 串联模型小腿长度 l2 [m]（同上）
+    com_offset: -0.0338              # home 姿态摆杆质心在髋轴下方 [m]（URDF：髋 z 0.1493 − 质心 z 0.115454）
+    h_min: 0.06                      # LQR 增益调度高度下限 [m]
+    h_max: 0.12                      # LQR 增益调度高度上限 [m]
+    use_measured_height: true        # 是否用关节角实测 h（false 则恒用 com_length 名义值）
+    height_timeout: 0.50             # 关节反馈年龄超过该值就退回 com_length [s]
+
+    # ---------------- Pitch 姿态来源 ----------------
+    theta_axis: pitch                # 姿态轴：pitch / roll
+    theta_offset: 0.0                # IMU 安装零位 [rad]：imu_site 与基座同向，静置 pitch ≈ 0
+    u_max: 0.40                     # 平衡力矩限幅 [N·m]（轮地摩擦上限约 μ·N·r≈0.4，超出就滑移、里程计失真）
+
+    # ---------------- 五杆腿 VMC（两条腿共用几何，各自独立状态） ----------------
+    l1: 0.050                        # O→A 前摆臂长度 [m]（URDF |lf_joint1→lf_joint2| = 0.0500，左右一致）
+    l2: 0.105                        # A→B 前连杆长度 [m]（URDF lf_joint2→轮轴 平面投影 = 0.1050，左右一致）
+    l3: 0.105                        # C→B 后连杆长度 [m]（URDF 闭链 |C-B| = 0.1052，取标称 0.105）
+    l4: 0.050                        # D→C 后摆臂长度 [m]（URDF |lb_joint1→lb_joint2| = 0.0500）
+    l5: 0.060                        # O→D 两髋关节间距 [m]（URDF 前后髋 origin x 差 0.060000）
+    foot_branch: 1                   # 正运动学装配分支：+1 足端在 A→C 连线下方，-1 取上方
+    front_branch: 1                  # 逆运动学前肘分支：+1 前肘 A 在 O→B 连线左侧，-1 取右侧
+    rear_branch: 1                   # 逆运动学后肘分支：+1 后肘 C 在 D→B 连线右侧，-1 取左侧
+
+    kp_x: 70.0                       # 足端前后刚度 [N/m]
+    kp_y: 600.0                      # 足端上下刚度 [N/m]（撑住整机重量，同时别太硬把机身弹起来）
+    kd_x: 4.0                        # 足端前后阻尼 [N·s/m]
+    kd_y: 40.0                       # 足端上下阻尼 [N·s/m]
+    force_max_x: 40.0                # 足端前后力限幅 [N]，<=0 表示该轴不限
+    force_max_y: 150.0               # 足端上下力限幅 [N]，<=0 表示该轴不限
+    foot_target_x: 0.03              # 足端前后目标位置 [m]（中位 = 两髋中点 l5/2；足端 y 由质心高度指令决定）
+    joint_torque_max: 8.0            # 单关节力矩限幅 [N·m]
+    joint_torque_sign: [1.0, 1.0, 1.0, 1.0]  # 四关节力矩符号 [左髋, 左膝, 右髋, 右膝]，方向反了改成 -1
+
+    # 关节角 → 五杆角标定：α/β = joint_sign·q + joint_offset（顺序同上：左前 α_L、左后 β_L、右前 α_R、右后 β_R）
+    # 曲柄在 URDF/MJCF 里的零位并不指向 +x（五杆图里 α=β=0 的方向），必须补偿：
+    #   α_L(0)=123.499°、β_L(0)=34.312°、α_R(0)=119.868°、β_R(0)=55.617°
+    # 右腿整体绕 x 轴转了 180°，关节轴在 base 系里反向，所以 joint_sign 取 -1。
+    # 数值来源：MuJoCo 里量 曲柄髋心→肘心 的平面方向（q=0 与 q=±0.4 线性拟合，斜率恰为 ±1），
+    # 残差 1e-3 度；标定后控制器 FK 复算的足端与模型差 < 0.3 mm（teach.md 12.7）。
+    # 注意：换 CAD / 换减速器零位后这 8 个数要重测。
+    joint_sign: [1.0, 1.0, -1.0, -1.0]
+    joint_offset: [2.155471, 0.598858, 2.092103, 0.970701]  # [rad]
+
+    # ---------------- 目标质心高度（上层指令修改，控制环内做斜坡；内部换算 足端_y = h - com_offset） ----------------
+    # 注意：foot_y = com_height - com_offset。按 URDF l1=0.0500、l2=0.1050、l5=0.0600，
+    # 五杆足端竖直可达上限只有约 0.148 m（曲柄与连杆共线时 = 奇异位形）。
+    # home 姿态（URDF/MJCF 站立零位）foot_y = 0.1172 m（髋 z 0.1493 − 轮轴 z 0.0321），
+    # 摆杆质心在髋轴下方 0.0338 m，故 h = 0.0834 m。
+    com_height_default: 0.0834       # 默认目标与 home 姿态一致（换算 foot_y = 0.1172 m）
+    com_height_min: 0.065            # 足端目标 y=0.0988 m
+    com_height_max: 0.100            # 足端目标 y=0.1338 m（约 90% 行程），避开伸直奇异位形
+    com_height_rate: 0.30            # 目标质心高度变化率上限 [m/s]（避免阶跃）
+
+    # ---------------- 轮子控制与分配 ----------------
+    wheel_separation: 0.305          # 轮距 L [m]（URDF 两轮轴 y = ±0.1525；按轮胎接地中心线量约 0.297）
+    max_linear_velocity: 1.0         # 车体线速度 v 限幅 [m/s]
+    max_yaw_rate: 3.0                # 车体偏航角速度 ω 限幅 [rad/s]
+    max_wheel_omega: 20.0            # 单轮角速度总限幅 [rad/s]（平衡 + 行驶之和）
+    max_balance_omega: 8.0           # 平衡分量限幅 [rad/s]
+    max_drive_omega: 12.0            # 行驶分量限幅 [rad/s]
+    # LQR 的力矩型输出 → 轮速目标的折算系数 [rad/s per N·m]，
+    # 下位机 M2006 是位置-速度串级 PID，只能接速度目标，故在此折算，需实机标定
+    balance_torque_to_omega: 1.0
+    balance_leak_rate: 60.0          # 平衡轮速指令一阶低通系数 [1/s]（可参数化，之前硬编码 6.0）
+
+    # ---------------- 安全门限（状态机见 control_state.hpp） ----------------
+    imu_timeout: 0.10                # IMU 数据年龄上限 [s]，超过置 kFaultImu
+    joint_state_timeout: 0.10        # 关节反馈年龄上限 [s]，超过置 kFaultJointState
+    wheel_state_timeout: 0.10        # 轮速/轮角反馈年龄上限 [s]，超过置 kFaultWheelState
+    command_timeout: 0.30            # 上层命令超时 → DEGRADED（停速度、保平衡）[s]
+    command_fault_timeout: 1.00      # 上层命令长期丢失 → FAULT（关节失力、轮子保持）[s]
+    max_pitch: 0.35                  # |pitch| 上限 [rad]（约 20°），超过置 kFaultAttitude
+    max_pitch_rate: 3.00             # |pitch_dot| 上限 [rad/s]，超过置 kFaultAttitude
+                                     # 正常站立实测 |pitch|≤0.02、|pitch_dot|≤0.2，启动瞬态最大约 0.17 rad；
+                                     # 姿态回到限内且角速度收敛后会自动重新起控（不需手动 enable）
+    startup_cycles: 250              # 进入 RUN 前需连续健康的周期数（500 Hz 下 0.5 s）
+
+    # ---------------- 话题 ----------------
+    imu_topic: imu/data              # IMU 话题（订阅）
+    odom_topic: odom                 # 里程计话题（leg_control 发布）
+    joint_states_topic: joint_states # 关节状态话题（订阅，2 轮 + 4 关节）
+    command_topic: robot_command     # 上层命令话题（订阅）
+    joint_target_topic: joint_target # 腿关节目标话题（发布，effort = 力矩）
+    wheel_target_topic: wheel_target # 轮速目标话题（发布，[ω_L, ω_R]）
+    leg_joint_names: [lf_joint1, lb_joint1,
+                      rf_joint1, rb_joint1]  # 4 个驱动髋 [左前, 左后, 右前, 右后]（顺序对应力矩）
+    wheel_joint_names: [lefoot_joint, rifoot_joint]              # 2 个轮关节名
+
+# 上层指令参数服务：rqt_reconfigure / ros2 param 动态修改后发布 /robot_command。
+command_param:
+  ros__parameters:
+    # =========================================================================
+    # 第一部分：启动配置与安全限幅（通常在节点启动加载，属于基础安全边界）
+    # =========================================================================
+    command_topic: robot_command     # [话题] 上层指令发布的 ROS2 话题名称，底盘控制器将订阅此话题获取控制流
+    publish_rate: 50.0               # [频率] 指令发布频率 [Hz]（50 Hz 既能保证指令平滑连续，又不会造成总线堵塞）
+    max_linear: 1.0                  # [限幅] 车体最大线速度硬限幅 [m/s]，防止遥操作时速度给过大导致失控跑偏
+    max_yaw: 3.0                     # [限幅] 车体最大偏航角速度（转向速率）硬限幅 [rad/s]，限制原地旋转过猛
+    com_height_min: 0.065            # [限幅] 质心高度安全下限 [m]，防止腿过分收缩导致机构产生机械干涉或触底
+    com_height_max: 0.100            # [限幅] 质心高度安全上限 [m]，防止腿伸得太直逼近奇异位形（约 90% 行程）
+    max_pitch_target: 0.30           # [限幅] 目标 Pitch 角最大绝对值 [rad]（约 11.5°），防止指令过大导致机器人倾覆
+
+    # =========================================================================
+    # 第二部分：动态运行指令（支持通过 rqt_reconfigure / ros2 param set 实时动态修改）
+    # =========================================================================
+    enable: true                     # [总开关] 控制器总使能：
+                                     #   - false = ZERO 状态（下发零力矩，电机卸力/失能）
+                                     #   - true  = 使能平衡与控制（具体行为由 teleop 状态决定）
+                                     
+    teleop: true                     # [模式选择] 操作模式切换：
+                                     #   - true  (且 enable=true) = TELEOP（遥操作模式，响应线速度与角速度指令）
+                                     #   - false (且 enable=true) = STAND  （原地站立模式，忽略速度指令，在原地维持平衡）
+                                     
+    estop: false                     # [急停开关] 软件紧急停止：
+                                     #   - true  = 触发急停，立即切断控制输出
+                                     #   - 注意：若要从急停状态恢复，必须先将 enable 设为 false，解除 estop 后重新使能
+                                     
+    linear_velocity: 0.0             # [运动指令] 目标车体线速度 [m/s]，仅在 teleop: true 时生效：
+                                     #   - 正数表示向前行驶，负数表示向后倒车
+                                     
+    yaw_rate: 0.0                    # [运动指令] 目标偏航角速度 [rad/s]，仅在 teleop: true 时生效：
+                                     #   - 正数表示向左原地旋转，负数表示向右原地旋转
+                                     
+    com_height: 0.0834               # [姿态指令] 目标质心高度 [m]（建议与 leg_control 中的 com_height_default 保持一致）：
+                                     #   - 动态微调该值可控制机器人整体“下蹲”或“起立”（必须在 min/max 范围内）
+                                     
+    pitch_target: 0.0                # [姿态指令] 目标 Pitch 倾角偏置 [rad]：
+                                     #   - 动态修改此值可让机器人主动向前倾（正数）或向后仰（负数）

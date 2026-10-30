@@ -21,13 +21,15 @@ namespace usb_drive
 #endif
 
 /// 轮子目标 / 反馈（M2006 + 位置-速度串级 PID）
-typedef struct {
+typedef struct
+{
   float angle;   ///< 角度 [rad]
   float omega;   ///< 角速度 [rad/s]
 } Wheel_t;
 
 /// 关节目标（RobStride 运动控制：τ = kp*(angle-θ) + kd*(omega-ω) + torque）
-typedef struct {
+typedef struct
+{
   float torque;  ///< 前馈力矩 [N*m]
   float angle;   ///< 目标角度 [rad]
   float omega;   ///< 目标角速度 [rad/s]
@@ -36,7 +38,8 @@ typedef struct {
 } JointTarget_t;
 
 /// 关节反馈（对应固件 RobStrideState_t，注意 uint64_t 会引入 4 B 填充）
-typedef struct {
+typedef struct
+{
   float rad;          ///< 关节角度 [rad]
   float omega;        ///< 关节角速度 [rad/s]
   float torque;       ///< 输出力矩 [N*m]
@@ -49,13 +52,15 @@ typedef struct {
 } JointState_t;
 
 /// 上位机 -> 下位机（96 B）
-typedef struct {
+typedef struct
+{
   Wheel_t wheel[2];
   JointTarget_t joint[4];
 } RobotTarget_t;
 
 /// 下位机 -> 上位机（208 B）
-typedef struct {
+typedef struct
+{
   Wheel_t wheel[2];
   JointState_t joint[4];
 } RobotState_t;

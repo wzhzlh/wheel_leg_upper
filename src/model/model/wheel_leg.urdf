@@ -1,497 +1,687 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!-- This URDF was automatically created by SolidWorks to URDF Exporter! Originally created by Stephen Brawner (brawner@gmail.com) 
+     Commit Version: 1.6.0-4-g7f85cfe  Build Version: 1.6.7995.38578
+     For more information, please see http://wiki.ros.org/sw_urdf_exporter -->
+
 <!--
-  双并腿轮足机器人（无 STL 版本，按实机外观用基本几何体搭建）
+  坐标系约定（本文件由 qq_down/wheel_leg 的最新 SolidWorks 导出重建）：
+      base_link : x 向前 / y 向左 / z 向上（REP-103），原点在两轮接地点中点（z=0 即棋盘地面）。
+  导出文件给的 base_link 是 "x 前 / y 下 / z 左"、原点在机身上方约 1 m，在 RViz 里整机是"侧躺"的。
+  这里对 4 个根关节和 base_link 自身的几何做了同一个刚体变换
+  （绕 x 轴 -90°，再平移 (0, -0.02668, -0.8847)）：模型形状、关节轴、连杆相对关系都没变，
+  只是换了根坐标系。
 
-  ============================ 建模约定 ============================
-  坐标系：x 向前、y 向左、z 向上（REP-103），长度单位 m，角度 rad。
-  外观取实机配色：橙色片状腿连杆 + 黑色机身 + 顶部黑色防护架 + 黑色蜂窝轮。
+  相对导出文件的其它改动（导出工具不会写这些）：
+    1) lf_foint2 是 CAD 里的拼写错误，这里改回 lf_joint2；
+    2) 网格路径 wheel_leg/meshes -> model/meshes（本仓库的包名是 model）；
+    3) 关节限位全部是 0，已按实机补回；两个轮子改回 continuous 并补 effort/velocity；
+    4) 补上 <ros2_control>（4 髋 + 2 轮，effort 命令接口）；
+    5) base_link 质心导出值 z=1.0258 明显错轴，改成网格包围盒中心。
 
-  拓扑（左右对称，两条腿的髋关节同轴、在 y 方向并排）：
-
-      base_link（机身，仿真的浮动基座；含顶部防护架）
-        ├─ leg_left_hip_joint  (revolute, 轴 +y)
-        │    └─ leg_left_thigh  （橙色髋块 + 大腿片）
-        │         └─ leg_left_knee_joint (revolute, 轴 +y)
-        │              └─ leg_left_shank （橙色膝块 + 小腿片）
-        │                   └─ wheel_left_joint (continuous, 轴 +y)
-        │                        └─ wheel_left （黑胎 + 浅灰轮毂）
-        ├─ leg_right_hip_joint / ... （与左侧镜像）
-        └─ imu_link (fixed)
-
-  零位：所有关节角 = 0 时，大腿、小腿都竖直向下，轮心在髋轴正下方
-        0.15 + 0.15 = 0.30 m 处；整机直立时 base_link 离地
-        0.30 + 0.065 = 0.365 m。
-        实机静止时是屈膝姿态（膝约 -0.5 rad），仿真里保持零位竖直、
-        用位置指令摆出站姿，这样 q_hip/q_knee 与 LQR 的高度公式
-        h = l1*cos(q_hip) + l2*cos(q_hip + q_knee) + com_offset 直接对应。
-
-  关节命名与实机保持一致（见 leg_calc/config/lqr_params.yaml 的
-  leg_joint_names 与 usb_drive 的 wheel_joint_names）：
-      leg_left_hip_joint, leg_left_knee_joint,
-      leg_right_hip_joint, leg_right_knee_joint,
-      wheel_left_joint, wheel_right_joint
-
-  关键尺寸（与 lqr_params.yaml 对应）：
-      thigh = 0.15 m（l1）, shank = 0.15 m（l2）
-      wheel_radius = 0.065 m, wheel_separation = 0.20 m
-
-  质量分配（对照 LQR 的 cart-pole 等效参数）：
-      机身 1.00（含防护架 0.15）+ 腿 2×(0.35+0.25) = 2.20 kg ≈ pendulum_mass(2.5)
-      轮子 2×0.20 = 0.40 kg                                  ≈ cart_mass(1.2) 的一部分
-  惯量按各视觉几何体手算后合并（分块质量见下面各 link）。
-
-  说明：base_link 是根连杆且带惯量，robot_state_publisher 启动时会打印
-  “The root link base_link has an inertia specified in the URDF, but KDL
-  does not support a root link with an inertia”，属于预期告警，不影响使用。
-  这里没有像机械臂那样加 world 虚拟根，是为了将来能把 odom->base_link
-  的 TF 直接接到 base_link 上（浮动基座）。
-  =================================================================
+  注意：MJCF（wheel_leg.xml）仍是 CAD 原始坐标系（"x 前 / y 下 / z 左"），
+  sim_bridge 的 IMU 姿态换算就是按那个约定写的，二者相差一个固定的旋转，互不影响。
 -->
-<robot name="wheel_leg">
-
-  <!-- ==================== ros2_control 硬件接口 ==================== -->
-  <!-- MuJoCo 仿真时由 mujoco_ros2_control/MujocoSystem 接管；
-       换到实机时把 plugin 换成真实硬件插件，关节名保持不变即可。 -->
+<robot
+  name="wheel_leg">
+  <link
+    name="base_link">
+    <inertial>
+      <!-- 质心 = 网格 base_link.STL 包围盒中心（机身中心）；导出值 z=1.0258 是 CAD 轴向错误 -->
+      <origin
+        xyz="-0.0008 0.00002 0.1213"
+        rpy="0 0 0" />
+      <mass
+        value="1.66745151375332" />
+      <inertia
+        ixx="0.0014874527795182"
+        ixy="-1.51918591032443E-05"
+        ixz="2.57932250432007E-08"
+        iyy="0.00132542865960578"
+        iyz="3.90953786244077E-07"
+        izz="0.00238734792579705" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 -0.02668 -0.8847"
+        rpy="-1.5708 0 0" />
+      <geometry>
+        <mesh
+          filename="package://model/meshes/base_link.STL" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="0.498039215686275 0.498039215686275 0.498039215686275 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 -0.02668 -0.8847"
+        rpy="-1.5708 0 0" />
+      <geometry>
+        <mesh
+          filename="package://model/meshes/base_link.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <link
+    name="lf_link1">
+    <inertial>
+      <origin
+        xyz="0.00948385723400235 0.0143580791372662 -0.0103514398458525"
+        rpy="0 0 0" />
+      <mass
+        value="0.0228632381715483" />
+      <inertia
+        ixx="3.04686185423604E-06"
+        ixy="1.10081747934945E-06"
+        ixz="4.28828329083756E-09"
+        iyy="2.10739645818087E-06"
+        iyz="6.49224353906418E-09"
+        izz="4.59132725164512E-06" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://model/meshes/lf_link1.STL" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="0.498039215686275 0.498039215686275 0.498039215686275 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://model/meshes/lf_link1.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint
+    name="lf_joint1"
+    type="revolute">
+    <origin
+      xyz="0.029206 0.131000 0.149300"
+      rpy="-1.5708 0 0" />
+    <parent
+      link="base_link" />
+    <child
+      link="lf_link1" />
+    <axis
+      xyz="0 0 -1" />
+    <limit
+      lower="-2.0"
+      upper="2.0"
+      effort="12.0"
+      velocity="20.0" />
+  </joint>
+  <link
+    name="lf_link2">
+    <inertial>
+      <origin
+        xyz="0.019985090582062 0.0904344951654388 -0.0103196720366778"
+        rpy="0 0 0" />
+      <mass
+        value="0.0355326730325909" />
+      <inertia
+        ixx="2.01199262288752E-05"
+        ixy="3.42919906932112E-06"
+        ixz="2.41261221597972E-08"
+        iyy="5.33549953452458E-06"
+        iyz="1.09185590215989E-07"
+        izz="2.52440000156163E-05" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://model/meshes/lf_link2.STL" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="0.498039215686275 0.498039215686275 0.498039215686275 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://model/meshes/lf_link2.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint
+    name="lf_joint2"
+    type="revolute">
+    <origin
+      xyz="0.0275573394802777 0.0417204151557571 0"
+      rpy="0 0 0.987058337135097" />
+    <parent
+      link="lf_link1" />
+    <child
+      link="lf_link2" />
+    <axis
+      xyz="0 0 -1" />
+    <limit
+      lower="-3.1416"
+      upper="3.1416"
+      effort="1.0"
+      velocity="20.0" />
+  </joint>
+  <link
+    name="lefoot_link">
+    <inertial>
+      <origin
+        xyz="-0.000169164679336475 0.000589514400822222 -0.0347413096902235"
+        rpy="0 0 0" />
+      <mass
+        value="0.130114342543911" />
+      <inertia
+        ixx="1.55093123288576E-05"
+        ixy="-6.29956912264913E-08"
+        ixz="-5.55153505268625E-10"
+        iyy="1.52660243240677E-05"
+        iyz="2.1749289550854E-09"
+        izz="2.33919231775256E-05" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://model/meshes/lefoot_link.STL" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="0.498039215686275 0.498039215686275 0.498039215686275 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://model/meshes/lefoot_link.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint
+    name="lefoot_joint"
+    type="continuous">
+    <origin
+      xyz="0.022658 0.10253 0.0215"
+      rpy="0 0 1.3533" />
+    <parent
+      link="lf_link2" />
+    <child
+      link="lefoot_link" />
+    <axis
+      xyz="0 0 -1" />
+    <limit
+      effort="3.0"
+      velocity="40.0" />
+  </joint>
+  <link
+    name="lb_link1">
+    <inertial>
+      <origin
+        xyz="-0.0133928913907946 0.00914000298324624 -0.00568390233836868"
+        rpy="0 0 0" />
+      <mass
+        value="0.0157407698288876" />
+      <inertia
+        ixx="1.69160183155362E-06"
+        ixy="-1.11451091966854E-06"
+        ixz="6.42669434977837E-09"
+        iyy="2.56410017625606E-06"
+        iyz="-4.38590919735264E-09"
+        izz="4.04885007020852E-06" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://model/meshes/lb_link1.STL" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="0.498039215686275 0.498039215686275 0.498039215686275 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://model/meshes/lb_link1.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint
+    name="lb_joint1"
+    type="revolute">
+    <origin
+      xyz="-0.030794 0.125500 0.149300"
+      rpy="-1.5708 0 0" />
+    <parent
+      link="base_link" />
+    <child
+      link="lb_link1" />
+    <axis
+      xyz="0 0 -1" />
+    <limit
+      lower="-2.0"
+      upper="2.0"
+      effort="12.0"
+      velocity="20.0" />
+  </joint>
+  <link
+    name="lb_link2">
+    <inertial>
+      <origin
+        xyz="0.00341434468767476 -0.0883877299014023 -0.00527986684678902"
+        rpy="0 0 0" />
+      <mass
+        value="0.0441319313931042" />
+      <inertia
+        ixx="2.94153999852251E-05"
+        ixy="-9.10046660313648E-07"
+        ixz="2.40733363049648E-08"
+        iyy="5.76523047848147E-06"
+        iyz="-6.22232437388317E-07"
+        izz="3.47959143449886E-05" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://model/meshes/lb_link2.STL" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="0.498039215686275 0.498039215686275 0.498039215686275 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://model/meshes/lb_link2.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint
+    name="lb_joint2"
+    type="revolute">
+    <origin
+      xyz="-0.041299 0.028185 0.01"
+      rpy="0 0 2.5427" />
+    <parent
+      link="lb_link1" />
+    <child
+      link="lb_link2" />
+    <axis
+      xyz="0 0 -1" />
+    <limit
+      lower="-3.1416"
+      upper="3.1416"
+      effort="1.0"
+      velocity="20.0" />
+  </joint>
+  <link
+    name="rf_link1">
+    <inertial>
+      <origin
+        xyz="0.00856950867055647 -0.0149218465912191 -0.0103514398458418"
+        rpy="0 0 0" />
+      <mass
+        value="0.0228632381715483" />
+      <inertia
+        ixx="3.18030735566914E-06"
+        ixy="-1.03374270983302E-06"
+        ixz="3.8748454279676E-09"
+        iyy="1.97395095674778E-06"
+        iyz="-6.74716034064078E-09"
+        izz="4.59132725164512E-06" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://model/meshes/rf_link1.STL" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="0.498039215686275 0.498039215686275 0.498039215686275 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://model/meshes/rf_link1.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint
+    name="rf_joint1"
+    type="revolute">
+    <origin
+      xyz="0.029206 -0.131000 0.149300"
+      rpy="1.5708 0 0" />
+    <parent
+      link="base_link" />
+    <child
+      link="rf_link1" />
+    <axis
+      xyz="0 0 -1" />
+    <limit
+      lower="-2.0"
+      upper="2.0"
+      effort="12.0"
+      velocity="20.0" />
+  </joint>
+  <link
+    name="rf_link2">
+    <inertial>
+      <origin
+        xyz="0.0412771656510127 -0.0829095733756017 -0.00435460838852823"
+        rpy="0 0 0" />
+      <mass
+        value="0.0355326730325909" />
+      <inertia
+        ixx="1.76352088113909E-05"
+        ixy="-6.50543681294772E-06"
+        ixz="4.98379114105508E-08"
+        iyy="7.82021695200882E-06"
+        iyz="-1.00098678650054E-07"
+        izz="2.52440000156163E-05" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://model/meshes/rf_link2.STL" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="0.498039215686275 0.498039215686275 0.498039215686275 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://model/meshes/rf_link2.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint
+    name="rf_joint2"
+    type="revolute">
+    <origin
+      xyz="0.0249005076512295 -0.0433585599243225 0"
+      rpy="0 0 -1.04949370860079" />
+    <parent
+      link="rf_link1" />
+    <child
+      link="rf_link2" />
+    <axis
+      xyz="0 0 -1" />
+    <limit
+      lower="-3.1416"
+      upper="3.1416"
+      effort="1.0"
+      velocity="20.0" />
+  </joint>
+  <link
+    name="rifoot_link">
+    <inertial>
+      <origin
+        xyz="-0.000197701326216104 -0.000475094687381494 -0.0329594986613461"
+        rpy="0 0 0" />
+      <mass
+        value="0.15505019042519" />
+      <inertia
+        ixx="1.8771315349037E-05"
+        ixy="1.04625723425938E-07"
+        ixz="-9.19186264343438E-10"
+        iyy="1.85945710947337E-05"
+        iyz="-2.07173266778658E-09"
+        izz="2.9826085386239E-05" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://model/meshes/rifoot_link.STL" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="0.266666666666667 0.266666666666667 0.266666666666667 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://model/meshes/rifoot_link.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint
+    name="rifoot_joint"
+    type="continuous">
+    <origin
+      xyz="0.046796 -0.093996 0.0215"
+      rpy="0 0 -1.1089" />
+    <parent
+      link="rf_link2" />
+    <child
+      link="rifoot_link" />
+    <axis
+      xyz="0 0 -1" />
+    <limit
+      effort="3.0"
+      velocity="40.0" />
+  </joint>
+  <link
+    name="rb_link1">
+    <inertial>
+      <origin
+        xyz="-0.00915664091865879 -0.0133815216400779 -0.00568390233836866"
+        rpy="0 0 0" />
+      <mass
+        value="0.0157407698288876" />
+      <inertia
+        ixx="2.56132855081977E-06"
+        ixy="1.11559183698975E-06"
+        ixz="4.39389305450335E-09"
+        iyy="1.69437345698991E-06"
+        iyz="6.42123847700385E-09"
+        izz="4.04885007020851E-06" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://model/meshes/rb_link1.STL" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="0.498039215686275 0.498039215686275 0.498039215686275 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://model/meshes/rb_link1.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint
+    name="rb_joint1"
+    type="revolute">
+    <origin
+      xyz="-0.030794 -0.125496 0.149300"
+      rpy="1.5708 0 0" />
+    <parent
+      link="base_link" />
+    <child
+      link="rb_link1" />
+    <axis
+      xyz="0 0 -1" />
+    <limit
+      lower="-2.0"
+      upper="2.0"
+      effort="12.0"
+      velocity="20.0" />
+  </joint>
+  <link
+    name="rb_link2">
+    <inertial>
+      <origin
+        xyz="0.0360808709755146 0.08076025814845 0.00472013315321243"
+        rpy="0 0 0" />
+      <mass
+        value="0.0441319313931042" />
+      <inertia
+        ixx="2.54999782369476E-05"
+        ixy="8.83730985618463E-06"
+        ixz="2.53969132017522E-07"
+        iyy="9.68065222675904E-06"
+        iyz="5.68552910151196E-07"
+        izz="3.47959143449886E-05" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://model/meshes/rb_link2.STL" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="0.498039215686275 0.498039215686275 0.498039215686275 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://model/meshes/rb_link2.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint
+    name="rb_joint2"
+    type="revolute">
+    <origin
+      xyz="-0.028236 -0.041264 0"
+      rpy="0 0 -2.1709" />
+    <parent
+      link="rb_link1" />
+    <child
+      link="rb_link2" />
+    <axis
+      xyz="0 0 -1" />
+    <limit
+      lower="-3.1416"
+      upper="3.1416"
+      effort="1.0"
+      velocity="20.0" />
+  </joint>
+  <!-- ==================== ros2_control：4 驱动髋(effort) + 2 轮(effort) ==================== -->
   <ros2_control name="wheel_leg_system" type="system">
     <hardware>
       <plugin>mujoco_ros2_control/MujocoSystem</plugin>
     </hardware>
-
-    <!-- 腿关节：位置伺服（实机对应 RobStride 的 kp/kd 位置控制） -->
-    <joint name="leg_left_hip_joint">
-      <command_interface name="position"/>
-      <state_interface name="position"/>
-      <state_interface name="velocity"/>
-      <state_interface name="effort"/>
-    </joint>
-
-    <joint name="leg_left_knee_joint">
-      <command_interface name="position"/>
-      <state_interface name="position"/>
-      <state_interface name="velocity"/>
-      <state_interface name="effort"/>
-    </joint>
-
-    <joint name="leg_right_hip_joint">
-      <command_interface name="position"/>
-      <state_interface name="position"/>
-      <state_interface name="velocity"/>
-      <state_interface name="effort"/>
-    </joint>
-
-    <joint name="leg_right_knee_joint">
-      <command_interface name="position"/>
-      <state_interface name="position"/>
-      <state_interface name="velocity"/>
-      <state_interface name="effort"/>
-    </joint>
-
-    <!-- 轮关节：力矩控制（实机对应 M2006，当前固件为位置-速度串级） -->
-    <joint name="wheel_left_joint">
+    <!-- 左前髋 / 左后髋 / 右前髋 / 右后髋：VMC 力矩控制 -->
+    <joint name="lf_joint1">
       <command_interface name="effort"/>
       <state_interface name="position"/>
       <state_interface name="velocity"/>
       <state_interface name="effort"/>
     </joint>
-
-    <joint name="wheel_right_joint">
+    <joint name="lb_joint1">
+      <command_interface name="effort"/>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+      <state_interface name="effort"/>
+    </joint>
+    <joint name="rf_joint1">
+      <command_interface name="effort"/>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+      <state_interface name="effort"/>
+    </joint>
+    <joint name="rb_joint1">
+      <command_interface name="effort"/>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+      <state_interface name="effort"/>
+    </joint>
+    <!-- 左右轮：力矩直通 -->
+    <joint name="lefoot_joint">
+      <command_interface name="effort"/>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+      <state_interface name="effort"/>
+    </joint>
+    <joint name="rifoot_joint">
       <command_interface name="effort"/>
       <state_interface name="position"/>
       <state_interface name="velocity"/>
       <state_interface name="effort"/>
     </joint>
   </ros2_control>
-
-  <!-- 实机配色 -->
-  <material name="frame_black">
-    <color rgba="0.07 0.07 0.08 1.0"/>
-  </material>
-  <material name="leg_orange">
-    <color rgba="0.93 0.42 0.10 1.0"/>
-  </material>
-  <material name="tire_black">
-    <color rgba="0.04 0.04 0.04 1.0"/>
-  </material>
-  <material name="hub_gray">
-    <color rgba="0.55 0.55 0.58 1.0"/>
-  </material>
-  <material name="imu_blue">
-    <color rgba="0.15 0.45 0.85 1.0"/>
-  </material>
-
-  <!-- ==================== 机身（含顶部防护架） ==================== -->
-  <link name="base_link">
-    <inertial>
-      <origin xyz="0 0 0.075" rpy="0 0 0"/>
-      <mass value="1.0"/>
-      <inertia ixx="0.005100" ixy="0" ixz="0"
-               iyy="0.006360" iyz="0"
-               izz="0.007560"/>
-    </inertial>
-
-    <!-- 主体：黑色电池/控制盒 -->
-    <visual>
-      <origin xyz="0 0 0.07" rpy="0 0 0"/>
-      <geometry>
-        <box size="0.24 0.20 0.10"/>
-      </geometry>
-      <material name="frame_black"/>
-    </visual>
-
-    <!-- 顶部防护架：4 根立柱 -->
-    <visual>
-      <origin xyz="0.09 0.07 0.16" rpy="0 0 0"/>
-      <geometry>
-        <box size="0.016 0.016 0.08"/>
-      </geometry>
-      <material name="frame_black"/>
-    </visual>
-    <visual>
-      <origin xyz="0.09 -0.07 0.16" rpy="0 0 0"/>
-      <geometry>
-        <box size="0.016 0.016 0.08"/>
-      </geometry>
-      <material name="frame_black"/>
-    </visual>
-    <visual>
-      <origin xyz="-0.09 0.07 0.16" rpy="0 0 0"/>
-      <geometry>
-        <box size="0.016 0.016 0.08"/>
-      </geometry>
-      <material name="frame_black"/>
-    </visual>
-    <visual>
-      <origin xyz="-0.09 -0.07 0.16" rpy="0 0 0"/>
-      <geometry>
-        <box size="0.016 0.016 0.08"/>
-      </geometry>
-      <material name="frame_black"/>
-    </visual>
-
-    <!-- 顶部防护架：前后横杆（沿 x） -->
-    <visual>
-      <origin xyz="0 0.07 0.20" rpy="0 0 0"/>
-      <geometry>
-        <box size="0.18 0.016 0.016"/>
-      </geometry>
-      <material name="frame_black"/>
-    </visual>
-    <visual>
-      <origin xyz="0 -0.07 0.20" rpy="0 0 0"/>
-      <geometry>
-        <box size="0.18 0.016 0.016"/>
-      </geometry>
-      <material name="frame_black"/>
-    </visual>
-
-    <!-- 顶部防护架：左右横杆（沿 y） -->
-    <visual>
-      <origin xyz="0.09 0 0.20" rpy="0 0 0"/>
-      <geometry>
-        <box size="0.016 0.14 0.016"/>
-      </geometry>
-      <material name="frame_black"/>
-    </visual>
-    <visual>
-      <origin xyz="-0.09 0 0.20" rpy="0 0 0"/>
-      <geometry>
-        <box size="0.016 0.14 0.016"/>
-      </geometry>
-      <material name="frame_black"/>
-    </visual>
-
-    <!-- 碰撞体只保留主体盒子，防护架不参与碰撞 -->
-    <collision>
-      <origin xyz="0 0 0.07" rpy="0 0 0"/>
-      <geometry>
-        <box size="0.24 0.20 0.10"/>
-      </geometry>
-    </collision>
-  </link>
-
-  <!-- ==================== 左腿：大腿 ==================== -->
-  <link name="leg_left_thigh">
-    <inertial>
-      <origin xyz="0 0 -0.07" rpy="0 0 0"/>
-      <mass value="0.35"/>
-      <inertia ixx="0.000760" ixy="0" ixz="0"
-               iyy="0.000740" iyz="0"
-               izz="0.000230"/>
-    </inertial>
-
-    <!-- 髋部橙色关节块 -->
-    <visual>
-      <origin xyz="0 0 -0.02" rpy="0 0 0"/>
-      <geometry>
-        <box size="0.05 0.05 0.05"/>
-      </geometry>
-      <material name="leg_orange"/>
-    </visual>
-
-    <!-- 大腿：橙色片状连杆 -->
-    <visual>
-      <origin xyz="0 0 -0.075" rpy="0 0 0"/>
-      <geometry>
-        <box size="0.035 0.045 0.13"/>
-      </geometry>
-      <material name="leg_orange"/>
-    </visual>
-
-    <collision>
-      <origin xyz="0 0 -0.075" rpy="0 0 0"/>
-      <geometry>
-        <box size="0.035 0.045 0.15"/>
-      </geometry>
-    </collision>
-  </link>
-
-  <joint name="leg_left_hip_joint" type="revolute">
-    <origin xyz="0 0.10 0" rpy="0 0 0"/>
-    <parent link="base_link"/>
-    <child link="leg_left_thigh"/>
-    <axis xyz="0 1 0"/>
-    <limit lower="-1.30" upper="1.30" effort="12.0" velocity="8.0"/>
-  </joint>
-
-  <!-- ==================== 左腿：小腿 ==================== -->
-  <link name="leg_left_shank">
-    <inertial>
-      <origin xyz="0 0 -0.06" rpy="0 0 0"/>
-      <mass value="0.25"/>
-      <inertia ixx="0.000630" ixy="0" ixz="0"
-               iyy="0.000610" iyz="0"
-               izz="0.000060"/>
-    </inertial>
-
-    <!-- 膝部橙色关节块 -->
-    <visual>
-      <origin xyz="0 0 -0.13" rpy="0 0 0"/>
-      <geometry>
-        <box size="0.045 0.05 0.045"/>
-      </geometry>
-      <material name="leg_orange"/>
-    </visual>
-
-    <!-- 小腿：橙色片状连杆 -->
-    <visual>
-      <origin xyz="0 0 -0.075" rpy="0 0 0"/>
-      <geometry>
-        <box size="0.030 0.040 0.13"/>
-      </geometry>
-      <material name="leg_orange"/>
-    </visual>
-
-    <collision>
-      <origin xyz="0 0 -0.075" rpy="0 0 0"/>
-      <geometry>
-        <box size="0.030 0.040 0.15"/>
-      </geometry>
-    </collision>
-  </link>
-
-  <!-- 膝限位：[-2.60, 0.10]。负角为弯曲方向（小腿向后折），
-       与 MJCF 及 LQR 的 h = l1*cos(q_hip) + l2*cos(q_hip+q_knee) 约定一致。 -->
-  <joint name="leg_left_knee_joint" type="revolute">
-    <origin xyz="0 0 -0.15" rpy="0 0 0"/>
-    <parent link="leg_left_thigh"/>
-    <child link="leg_left_shank"/>
-    <axis xyz="0 1 0"/>
-    <limit lower="-2.60" upper="0.10" effort="12.0" velocity="8.0"/>
-  </joint>
-
-  <!-- ==================== 左轮 ==================== -->
-  <link name="wheel_left">
-    <inertial>
-      <origin xyz="0 0 0" rpy="0 0 0"/>
-      <mass value="0.20"/>
-      <inertia ixx="0.000220" ixy="0" ixz="0"
-               iyy="0.000400" iyz="0"
-               izz="0.000220"/>
-    </inertial>
-
-    <!-- 轮胎 -->
-    <visual>
-      <origin xyz="0 0 0" rpy="1.5707963 0 0"/>
-      <geometry>
-        <cylinder radius="0.065" length="0.035"/>
-      </geometry>
-      <material name="tire_black"/>
-    </visual>
-
-    <!-- 轮毂 -->
-    <visual>
-      <origin xyz="0 0 0" rpy="1.5707963 0 0"/>
-      <geometry>
-        <cylinder radius="0.045" length="0.038"/>
-      </geometry>
-      <material name="hub_gray"/>
-    </visual>
-
-    <collision>
-      <origin xyz="0 0 0" rpy="1.5707963 0 0"/>
-      <geometry>
-        <cylinder radius="0.065" length="0.035"/>
-      </geometry>
-    </collision>
-  </link>
-
-  <joint name="wheel_left_joint" type="continuous">
-    <origin xyz="0 0 -0.15" rpy="0 0 0"/>
-    <parent link="leg_left_shank"/>
-    <child link="wheel_left"/>
-    <axis xyz="0 1 0"/>
-    <limit effort="3.0" velocity="50.0"/>
-  </joint>
-
-  <!-- ==================== 右腿：大腿 ==================== -->
-  <link name="leg_right_thigh">
-    <inertial>
-      <origin xyz="0 0 -0.07" rpy="0 0 0"/>
-      <mass value="0.35"/>
-      <inertia ixx="0.000760" ixy="0" ixz="0"
-               iyy="0.000740" iyz="0"
-               izz="0.000230"/>
-    </inertial>
-
-    <visual>
-      <origin xyz="0 0 -0.02" rpy="0 0 0"/>
-      <geometry>
-        <box size="0.05 0.05 0.05"/>
-      </geometry>
-      <material name="leg_orange"/>
-    </visual>
-
-    <visual>
-      <origin xyz="0 0 -0.075" rpy="0 0 0"/>
-      <geometry>
-        <box size="0.035 0.045 0.13"/>
-      </geometry>
-      <material name="leg_orange"/>
-    </visual>
-
-    <collision>
-      <origin xyz="0 0 -0.075" rpy="0 0 0"/>
-      <geometry>
-        <box size="0.035 0.045 0.15"/>
-      </geometry>
-    </collision>
-  </link>
-
-  <joint name="leg_right_hip_joint" type="revolute">
-    <origin xyz="0 -0.10 0" rpy="0 0 0"/>
-    <parent link="base_link"/>
-    <child link="leg_right_thigh"/>
-    <axis xyz="0 1 0"/>
-    <limit lower="-1.30" upper="1.30" effort="12.0" velocity="8.0"/>
-  </joint>
-
-  <!-- ==================== 右腿：小腿 ==================== -->
-  <link name="leg_right_shank">
-    <inertial>
-      <origin xyz="0 0 -0.06" rpy="0 0 0"/>
-      <mass value="0.25"/>
-      <inertia ixx="0.000630" ixy="0" ixz="0"
-               iyy="0.000610" iyz="0"
-               izz="0.000060"/>
-    </inertial>
-
-    <visual>
-      <origin xyz="0 0 -0.13" rpy="0 0 0"/>
-      <geometry>
-        <box size="0.045 0.05 0.045"/>
-      </geometry>
-      <material name="leg_orange"/>
-    </visual>
-
-    <visual>
-      <origin xyz="0 0 -0.075" rpy="0 0 0"/>
-      <geometry>
-        <box size="0.030 0.040 0.13"/>
-      </geometry>
-      <material name="leg_orange"/>
-    </visual>
-
-    <collision>
-      <origin xyz="0 0 -0.075" rpy="0 0 0"/>
-      <geometry>
-        <box size="0.030 0.040 0.15"/>
-      </geometry>
-    </collision>
-  </link>
-
-  <joint name="leg_right_knee_joint" type="revolute">
-    <origin xyz="0 0 -0.15" rpy="0 0 0"/>
-    <parent link="leg_right_thigh"/>
-    <child link="leg_right_shank"/>
-    <axis xyz="0 1 0"/>
-    <limit lower="-2.60" upper="0.10" effort="12.0" velocity="8.0"/>
-  </joint>
-
-  <!-- ==================== 右轮 ==================== -->
-  <link name="wheel_right">
-    <inertial>
-      <origin xyz="0 0 0" rpy="0 0 0"/>
-      <mass value="0.20"/>
-      <inertia ixx="0.000220" ixy="0" ixz="0"
-               iyy="0.000400" iyz="0"
-               izz="0.000220"/>
-    </inertial>
-
-    <visual>
-      <origin xyz="0 0 0" rpy="1.5707963 0 0"/>
-      <geometry>
-        <cylinder radius="0.065" length="0.035"/>
-      </geometry>
-      <material name="tire_black"/>
-    </visual>
-
-    <visual>
-      <origin xyz="0 0 0" rpy="1.5707963 0 0"/>
-      <geometry>
-        <cylinder radius="0.045" length="0.038"/>
-      </geometry>
-      <material name="hub_gray"/>
-    </visual>
-
-    <collision>
-      <origin xyz="0 0 0" rpy="1.5707963 0 0"/>
-      <geometry>
-        <cylinder radius="0.065" length="0.035"/>
-      </geometry>
-    </collision>
-  </link>
-
-  <joint name="wheel_right_joint" type="continuous">
-    <origin xyz="0 0 -0.15" rpy="0 0 0"/>
-    <parent link="leg_right_shank"/>
-    <child link="wheel_right"/>
-    <axis xyz="0 1 0"/>
-    <limit effort="3.0" velocity="50.0"/>
-  </joint>
-
-  <!-- ==================== IMU ==================== -->
-  <!-- 放在防护架顶部，与实机 /imu/data 的 frame_id=imu_link 保持一致 -->
-  <link name="imu_link">
-    <inertial>
-      <origin xyz="0 0 0" rpy="0 0 0"/>
-      <mass value="0.01"/>
-      <inertia ixx="1e-06" ixy="0" ixz="0"
-               iyy="1e-06" iyz="0"
-               izz="1e-06"/>
-    </inertial>
-    <visual>
-      <origin xyz="0 0 0" rpy="0 0 0"/>
-      <geometry>
-        <box size="0.03 0.03 0.008"/>
-      </geometry>
-      <material name="imu_blue"/>
-    </visual>
-  </link>
-
-  <joint name="imu_joint" type="fixed">
-    <origin xyz="0 0 0.16" rpy="0 0 0"/>
-    <parent link="base_link"/>
-    <child link="imu_link"/>
-  </joint>
-
 </robot>

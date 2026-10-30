@@ -48,3 +48,45 @@ mujoco_ros2_control:
       gt: [ 0.0 ]
     }
   }
+
+  # ------------------------------------------------------------------
+  # 启动门控（启动挂架）
+  #   控制器（joint_state_broadcaster / leg_effort_controller /
+  #   wheel_effort_controller）全部 active 之前不做物理积分，
+  #   只按固定步长推进仿真时钟并保持 qpos/qvel 不变。
+  #   这样 joint_states、IMU、/clock 照常发布，上层 leg_control 能正常
+  #   完成自检并进入 RUN；等它准备好再放开物理，机器人不会先自由落体。
+  # ------------------------------------------------------------------
+  start_gate_enabled: {
+    type: bool,
+    default_value: true,
+    read_only: true,
+    description: "Hold the robot (no physics integration) until the controllers are active"
+  }
+
+  start_gate_controllers: {
+    type: string_array,
+    default_value: ["joint_state_broadcaster", "leg_effort_controller", "wheel_effort_controller"],
+    read_only: true,
+    description: "Controllers that must all be active before physics stepping starts"
+  }
+
+  start_gate_hold: {
+    type: double,
+    default_value: 1.0,
+    read_only: true,
+    description: "Extra hold time [s, simulation time] after all controllers became active",
+    validation: {
+      gt_eq: [ 0.0 ]
+    }
+  }
+
+  start_gate_timeout: {
+    type: double,
+    default_value: 20.0,
+    read_only: true,
+    description: "Max hold time [s, simulation time] before the gate is force-opened",
+    validation: {
+      gt: [ 0.0 ]
+    }
+  }

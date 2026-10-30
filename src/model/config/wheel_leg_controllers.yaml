@@ -1,14 +1,14 @@
-# MuJoCo 仿真用 ros2_control 配置
+# MuJoCo 仿真用 ros2_control 配置（真实五杆模型）
 #
 # 分工：
-#   joint_state_broadcaster   -> /joint_states（6 个关节的 position/velocity/effort）
-#   leg_position_controller   -> /leg_position_controller/commands（Float64MultiArray，4 个腿关节目标角）
-#   wheel_effort_controller   -> /wheel_effort_controller/commands（Float64MultiArray，2 个轮子力矩）
+#   joint_state_broadcaster  -> /joint_states（ros2_control 声明的 6 个驱动关节）
+#   leg_effort_controller    -> /leg_effort_controller/commands（4 个驱动髋力矩，与 VMC 一致）
+#   wheel_effort_controller  -> /wheel_effort_controller/commands（2 个轮子力矩）
 #
-# 力矩顺序与 URDF 的 ros2_control 声明顺序一致：
-#   wheel_effort_controller /commands = [wheel_left_joint, wheel_right_joint]
-#   leg_position_controller /commands = [leg_left_hip_joint, leg_left_knee_joint,
-#                                        leg_right_hip_joint, leg_right_knee_joint]
+# 关节名与 URDF 一致（SolidWorks 命名）：
+#   4 个驱动髋：lf_joint1(左前) lb_joint1(左后) rf_joint1(右前) rb_joint1(右后)
+#   2 个轮子：lefoot_joint(左) rifoot_joint(右)
+# 力矩顺序与 URDF 的 ros2_control 声明顺序一致。
 
 controller_manager:
   ros__parameters:
@@ -17,26 +17,66 @@ controller_manager:
     joint_state_broadcaster:
       type: joint_state_broadcaster/JointStateBroadcaster
 
-    leg_position_controller:
-      type: position_controllers/JointGroupPositionController
+    leg_effort_controller:
+      type: effort_controllers/JointGroupEffortController
 
     wheel_effort_controller:
       type: effort_controllers/JointGroupEffortController
 
 # joint_state_broadcaster 不需要额外配置：
-# 六个驱动关节都在 URDF 的 <ros2_control> 里声明了 position/velocity/effort，
+# 6 个驱动关节都在 URDF 的 <ros2_control> 里声明了 position/velocity/effort，
 # 广播器会自动全量发布到 /joint_states。
 
-leg_position_controller:
+leg_effort_controller:
   ros__parameters:
     joints:
-      - leg_left_hip_joint
-      - leg_left_knee_joint
-      - leg_right_hip_joint
-      - leg_right_knee_joint
+      - lf_joint1      # 左前髋（VMC α_L）
+      - lb_joint1      # 左后髋（VMC β_L）
+      - rf_joint1      # 右前髋（VMC α_R）
+      - rb_joint1      # 右后髋（VMC β_R）
 
 wheel_effort_controller:
   ros__parameters:
     joints:
-      - wheel_left_joint
-      - wheel_right_joint
+      - lefoot_joint   # 左轮
+      - rifoot_joint   # 右轮
+
+# ------------------------------------------------------------------
+# 仿真 I/O 桥（leg_calc/sim_bridge_node）
+#   mujoco 插件的 IMU 只有 gyro + accel，orientation 恒为 0，
+#   这里用 /imu_site_pose_sensor/pose 的四元数补齐后发到 /imu/data。
+#   joint_target / wheel_target 也在这里翻译成两个 effort 控制器的命令。
+# ------------------------------------------------------------------
+sim_bridge:
+  ros__parameters:
+    # 输入
+    imu_raw_topic: imu_site_imu_sensor/imu     # mujoco_ros2_control 的 IMU（无 orientation）
+    pose_topic: imu_site_pose_sensor/pose      # imu_site（基座同向）世界位姿（含四元数）
+    joint_target_topic: joint_target           # leg_control 输出：4 髋力矩
+    wheel_target_topic: wheel_target           # leg_control 输出：轮速目标
+    joint_states_topic: joint_states           # 实测轮速用
+    # 输出
+    imu_out_topic: imu/data                    # leg_control 订阅的 IMU 话题
+    leg_cmd_topic: leg_effort_controller/commands
+    wheel_cmd_topic: wheel_effort_controller/commands
+    # 频率
+    imu_rate: 200.0                            # 合成 IMU 的发布频率 [Hz]
+    cmd_rate: 500.0                            # 指令下发频率 [Hz]，与 update_rate 对齐
+    sensor_timeout: 0.10                       # pose 或 gyro 停更时停止合成 IMU
+    # 轮速 → 力矩（仿真没有下位机速度环，只能用力矩跟）
+    # 轮子惯量极小（J≈3e-5 kg·m²），P 有个硬上限：kp < 2J/Δt ≈ 0.03，超过直接抖
+    wheel_kp: 0.02                             # [N·m per rad/s]
+    wheel_ki: 2.0                              # [N·m per (rad/s·s)]，靠积分把力矩垫上去
+    wheel_tau_max: 3.0                         # 轮子力矩限幅 [N·m]，与 MJCF motor ctrlrange 一致
+    wheel_mode: torque                         # /wheel_target 直接当轮轴力矩（LQR 本来就是力矩输出）
+    wheel_torque_gain: 1.0                     # torque 模式下的力矩增益
+    wheel_start_delay: 1.45                    # 仅在 wheel_arm_on_gate=false 时生效
+    wheel_arm_on_gate: true                    # 跟门控 latched 话题：物理步进真正放开的那一刻才开始下发轮子力矩，
+                                               # 避免"挂架还夹着机身、轮子先转起来"（放开瞬间前冲，启动瞬态变大）
+    leg_torque_max: 12.0                       # 髋力矩限幅 [N·m]，与 MJCF motor ctrlrange 一致
+    command_timeout: 0.25                      # 超过该时间没新指令就清零 [s]
+    # base_link 轴向与实机 IMU 不一定同向：机器人一使能就反向加速时改成 true
+    flip_roll_pitch: false
+    # 关节顺序（必须与两个 controller 的 joints 顺序一致）
+    leg_joint_order: [lf_joint1, lb_joint1, rf_joint1, rb_joint1]
+    wheel_joint_order: [lefoot_joint, rifoot_joint]

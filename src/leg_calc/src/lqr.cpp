@@ -41,6 +41,17 @@ LqrSolution solveContinuousLqr(
   if (n == 0) {
     return result;
   }
+  if (!A.allFinite() || !B.allFinite() || !Q.allFinite() || !R.allFinite() ||
+    !R.isApprox(R.transpose(), 1e-10))
+  {
+    return result;
+  }
+  const Eigen::LDLT<Eigen::MatrixXd> r_ldlt(R);
+  if (r_ldlt.info() != Eigen::Success ||
+    !(r_ldlt.vectorD().array() > 0.0).all())
+  {
+    return result;
+  }
 
   const Eigen::MatrixXd R_inv = R.inverse();
   const Eigen::MatrixXd B_Rinv_Bt = B * R_inv * B.transpose();
@@ -150,6 +161,9 @@ void GainSchedule::setWeights(const Eigen::MatrixXd & Q, const Eigen::MatrixXd &
   if (R.rows() != 1 || R.cols() != 1) {
     throw std::invalid_argument("R 必须是 1x1");
   }
+  if (!Q.allFinite() || !R.allFinite() || !(R(0, 0) > 0.0)) {
+    throw std::invalid_argument("Q/R 必须有限，且 R 必须为正");
+  }
   Q_ = Q;
   R_ = R;
   cache_valid_ = false;
@@ -157,6 +171,9 @@ void GainSchedule::setWeights(const Eigen::MatrixXd & Q, const Eigen::MatrixXd &
 
 void GainSchedule::setQuadraticCoefficients(const Eigen::Matrix<double, 4, 3> & coeffs)
 {
+  if (!coeffs.allFinite()) {
+    throw std::invalid_argument("k_coeffs 必须全部为有限值");
+  }
   coeffs_ = coeffs;
   // 全零视为“未提供系数”，退回在线 LQR
   coeffs_valid_ = coeffs_.cwiseAbs().maxCoeff() > 0.0;
@@ -182,6 +199,7 @@ GainSchedule::Gain GainSchedule::gainAt(double com_height)
     for (int j = 0; j < 4; ++j) {
       gain(0, j) = coeffs_(j, 0) * h * h + coeffs_(j, 1) * h + coeffs_(j, 2);
     }
+    last_solve_ok_ = gain.allFinite();
     return gain;
   }
 
@@ -190,9 +208,11 @@ GainSchedule::Gain GainSchedule::gainAt(double com_height)
   }
 
   const Gain gain = solveLqrAt(h);
-  cached_gain_ = gain;
-  cached_h_ = h;
-  cache_valid_ = true;
+  if (last_solve_ok_) {
+    cached_gain_ = gain;
+    cached_h_ = h;
+    cache_valid_ = true;
+  }
   return gain;
 }
 

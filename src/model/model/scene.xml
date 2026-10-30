@@ -1,8 +1,14 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-  MuJoCo 场景文件：地面 + 光照 + 机器人本体。
+  MuJoCo 场景文件：地面 + 光照 + 台阶/平台 + 机器人本体。
   launch 里的 mjcf_path 参数指向本文件（而不是 wheel_leg.xml），
   这样仿真里才有地面可以站立/滚动。
+
+  布局参考 ATWheelLeg 的轮腿场景
+  （/home/zhangjiayi/RL/ATWheelLeg/MujocoSim/scr/car/model/scene.xml）：
+  地面用大平面 + 棋盘材质，台阶与平台做成一组 box。
+  机器人出生点仍在原点，台阶放在 x ≈ 5 m 之外，不影响原点附近的平衡调试；
+  只做平衡/轮速标定时，把 <body name="terrain"> 整段注释掉即可。
 -->
 <mujoco model="wheel_leg_scene">
   <include file="wheel_leg.xml"/>
@@ -26,8 +32,26 @@
   </asset>
 
   <worldbody>
-    <geom name="ground" type="plane" size="8 8 0.1" pos="0 0 0"
-          material="groundplane" friction="1.2 0.01 0.0001"/>
-    <light name="main_light" pos="0 0 4" dir="0 0 -1" directional="true"/>
+    <!-- 无限平面：size 的第 3 维对 plane 无意义，只为和参考场景保持一致 -->
+    <geom name="ground" type="plane" size="50 50 0.3" pos="0 0 0"
+          material="groundplane" friction="1.2 0.01 0.0001" contype="1" conaffinity="1"/>
+
+    <light name="main_light" pos="0 0 5" dir="0 0 -1" directional="true"/>
+
+    <!-- 台阶 + 平台（越障测试用）：
+         4 级台阶每级抬高 0.05 m、深 0.30 m，末端接 0.2 m 高平台；
+         沿 y 方向拉长到 5 m，保证轮子不会从侧面掉下去。 -->
+    <body name="terrain">
+      <geom name="step1" type="box" size="0.15 5 0.05" pos="5.15 0 0.05"
+            rgba="0.4 0.4 0.4 1"/>
+      <geom name="step2" type="box" size="0.15 5 0.10" pos="5.45 0 0.10"
+            rgba="0.5 0.5 0.5 1"/>
+      <geom name="step3" type="box" size="0.15 5 0.15" pos="5.75 0 0.15"
+            rgba="0.6 0.6 0.6 1"/>
+      <geom name="step4" type="box" size="0.15 5 0.20" pos="6.05 0 0.20"
+            rgba="0.7 0.7 0.7 1"/>
+      <geom name="platform" type="box" size="0.50 5 0.20" pos="6.70 0 0.20"
+            rgba="0.8 0.8 0.8 1"/>
+    </body>
   </worldbody>
 </mujoco>

@@ -15,7 +15,6 @@ find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
-find_package(nav_msgs REQUIRED)
 
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(LIBUSB REQUIRED libusb-1.0)
@@ -36,7 +35,7 @@ ament_target_dependencies(usb_drive_cdc rclcpp)
 # 通信节点：控制指令下发 + 下位机状态上行
 add_executable(usb_drive_node src/usb_drive_node.cpp)
 target_link_libraries(usb_drive_node usb_drive_cdc)
-ament_target_dependencies(usb_drive_node rclcpp std_msgs sensor_msgs nav_msgs)
+ament_target_dependencies(usb_drive_node rclcpp std_msgs sensor_msgs)
 
 install(
   TARGETS usb_drive_node

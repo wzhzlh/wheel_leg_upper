@@ -67,6 +67,16 @@ namespace mujoco_ros2_control {
         publisher_ = nh_->create_publisher<rosgraph_msgs::msg::Clock>("/clock", rclcpp::SystemDefaultsQoS());
         clock_publisher_ = std::make_unique<ClockPublisher>(publisher_);
 
+        // 启动门控状态（latched）：sim_bridge 据此决定何时给轮子下发力矩，
+        // 避免"挂架还夹着机身、轮子已经出大力"导致释放瞬间被弹飞。
+        start_gate_publisher_ = nh_->create_publisher<std_msgs::msg::Bool>(
+            "/mujoco/start_gate_open", rclcpp::QoS(1).transient_local().reliable());
+        {
+            std_msgs::msg::Bool gate_msg;
+            gate_msg.data = false;
+            start_gate_publisher_->publish(gate_msg);
+        }
+
         // mujoco related parameters
         show_gui_ = params_.show_gui;
         real_time_factor_ = params_.real_time_factor;
@@ -77,14 +87,45 @@ namespace mujoco_ros2_control {
         init_controller_manager();
 
         // Start MuJoCo
-        mj_resetData(mujoco_model_, mujoco_data_);
+        // 有 keyframe 就用 keyframe 0（"home"）：hinge 的 qpos0 恒为 0，机身高度又只由
+        // base_link 的 pos 决定，想要"两轮同时着地"这类初始姿态只能通过 keyframe 给。
+        if (mujoco_model_->nkey > 0) {
+            mj_resetDataKeyframe(mujoco_model_, mujoco_data_, 0);
+        } else {
+            mj_resetData(mujoco_model_, mujoco_data_);
+        }
 
         // compute forward kinematics for new pos
+        // 注意：这里不再先跑一步 mj_step。控制还没起来的时候积分没有任何意义，
+        // 反而会把机器人往地上砸（闭链 + 接触求解很容易把模型弹飞）。
+        // 第一个物理步由 update() 里的启动门控决定什么时候执行。
         mj_forward(mujoco_model_, mujoco_data_);
-
-        // run simulation to setup the new pos
-        mj_step(mujoco_model_, mujoco_data_);
         mujoco_start_time_ = mujoco_data_->time;
+
+        // 记录挂架要保持的机身位姿（自由关节 qpos 前 7 个）
+        for (int j = 0; j < mujoco_model_->njnt; j++) {
+            if (mujoco_model_->jnt_type[j] != mjJNT_FREE) {
+                continue;
+            }
+            const int qpos_adr = mujoco_model_->jnt_qposadr[j];
+            for (int k = 0; k < 7; k++) {
+                hold_base_qpos_[k] = mujoco_data_->qpos[qpos_adr + k];
+            }
+            break;
+        }
+
+        if (params_.start_gate_enabled) {
+            std::string required;
+            for (const auto &name : params_.start_gate_controllers) {
+                if (!required.empty()) {
+                    required += ", ";
+                }
+                required += name;
+            }
+            RCLCPP_INFO(nh_->get_logger(),
+                        "启动门控已启用：等 [%s] 全部 active 后再保持 %.2f s 才放开物理步进",
+                        required.c_str(), params_.start_gate_hold);
+        }
 
         clock_gettime(CLOCK_MONOTONIC, &startTime_);
 #ifdef USE_LIBSIMULATE
@@ -100,6 +141,9 @@ namespace mujoco_ros2_control {
     MujocoRos2Control::~MujocoRos2Control()
     {
         stop_.store(true);
+        if (start_gate_thread_.joinable()) {
+            start_gate_thread_.join();
+        }
         for (auto &thread : camera_threads_) {
             thread.join();
         }
@@ -139,8 +183,8 @@ namespace mujoco_ros2_control {
                         // update the mujoco model with the result of the controller
                         controller_manager_->write(sim_time_ros, sim_period);
                     }
-                    // Calculate the next mujoco step
-                    mj_step(mujoco_model_, mujoco_data_);
+                    // Calculate the next mujoco step（启动门控没放开时只推进时钟，不积分）
+                    step_simulation();
                 }
             }
         } else {
@@ -148,6 +192,122 @@ namespace mujoco_ros2_control {
             mj_vis_.sim->speed_changed = true;
         }
         mj_vis_.update();
+    }
+
+    void MujocoRos2Control::step_simulation() {
+        if (start_gate_opened_) {
+            mj_step(mujoco_model_, mujoco_data_);
+            return;
+        }
+
+        // ---- 启动门控：挂架模式 ----
+        // 正常积分一步，然后每一步把机身（free joint）的水平位移/姿态按回初始值、竖直方向放开，
+        // 相当于把躯干挂在试验台的竖直导轨上：
+        //   * 机身不会倒、不会漂 → 控制器起来之前不会自由落体、也不会被接触求解弹飞；
+        //   * 腿、轮子仍按控制器指令真实运动，竖直方向还能被 VMC 顶到目标高度
+        //     → 释放瞬间不会因为"指令一直在涨、状态却一直是 0"而猛冲；
+        //   * /clock、joint_states、IMU 都照常发布 → leg_control 能走完启动自检。
+        mj_step(mujoco_model_, mujoco_data_);
+        clamp_base_to_hold_pose();
+        mj_forward(mujoco_model_, mujoco_data_);
+
+        update_start_gate();
+    }
+
+    void MujocoRos2Control::clamp_base_to_hold_pose() {
+        for (int j = 0; j < mujoco_model_->njnt; j++) {
+            if (mujoco_model_->jnt_type[j] != mjJNT_FREE) {
+                continue;
+            }
+            const int qpos_adr = mujoco_model_->jnt_qposadr[j];
+            const int dof_adr = mujoco_model_->jnt_dofadr[j];
+
+            // 只夹住水平位移和姿态，竖直方向放开着：
+            // 相当于把机器人挂在"竖直导轨"上——机身不会倒、不会漂，
+            // 但腿仍然能按 VMC 的指令把机身顶到目标高度，轮子也能自由滚动。
+            // 这样放开时腿已经处在控制器想要的姿态，不会因为"腿被冻住、指令却一直在涨"而抖一下。
+            mujoco_data_->qpos[qpos_adr + 0] = hold_base_qpos_[0];
+            mujoco_data_->qpos[qpos_adr + 1] = hold_base_qpos_[1];
+            for (int k = 3; k < 7; k++) {
+                mujoco_data_->qpos[qpos_adr + k] = hold_base_qpos_[k];
+            }
+            mujoco_data_->qvel[dof_adr + 0] = 0.0;
+            mujoco_data_->qvel[dof_adr + 1] = 0.0;
+            for (int k = 3; k < 6; k++) {
+                mujoco_data_->qvel[dof_adr + k] = 0.0;
+            }
+        }
+    }
+
+    bool MujocoRos2Control::start_gate_controllers_active() {
+        if (!controller_manager_) {
+            return false;
+        }
+        const auto controllers = controller_manager_->get_loaded_controllers();
+        for (const auto &required : params_.start_gate_controllers) {
+            const auto it = std::find_if(
+                    controllers.begin(), controllers.end(),
+                    [&required](const controller_manager::ControllerSpec &spec) {
+                        return spec.info.name == required;
+                    });
+            if (it == controllers.end() || !it->c) {
+                return false;
+            }
+            if (it->c->get_state().id() != lifecycle_msgs::msg::State::PRIMARY_STATE_ACTIVE) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    void MujocoRos2Control::update_start_gate() {
+        if (start_gate_opened_) {
+            return;
+        }
+
+        const double sim_now = mujoco_data_->time;
+
+        auto publish_open = [this]() {
+            if (!start_gate_publisher_) {
+                return;
+            }
+            std_msgs::msg::Bool gate_msg;
+            gate_msg.data = true;
+            start_gate_publisher_->publish(gate_msg);
+        };
+
+        if (!params_.start_gate_enabled) {
+            start_gate_opened_ = true;
+            publish_open();
+            RCLCPP_INFO(nh_->get_logger(), "启动门控已关闭，立即开始物理步进");
+            return;
+        }
+
+        if (start_gate_ready_time_ < 0.0) {
+            if (!start_gate_controllers_active_.load()) {
+                if (!start_gate_timeout_warned_ && sim_now > params_.start_gate_timeout) {
+                    start_gate_timeout_warned_ = true;
+                    start_gate_opened_ = true;
+                    publish_open();
+                    RCLCPP_WARN(nh_->get_logger(),
+                                "等待控制器 active 超过 %.1f s（仿真时间），强制放开启动门控",
+                                params_.start_gate_timeout);
+                }
+                return;
+            }
+            start_gate_ready_time_ = sim_now;
+            RCLCPP_INFO(nh_->get_logger(),
+                        "控制器已全部 active（sim t=%.3f），挂架保持 %.2f s 后放开物理步进",
+                        sim_now, params_.start_gate_hold);
+        }
+
+        if (sim_now - start_gate_ready_time_ >= params_.start_gate_hold) {
+            start_gate_opened_ = true;
+            publish_open();
+            RCLCPP_INFO(nh_->get_logger(),
+                        "启动门控放开：开始物理步进（sim t=%.3f，挂架保持 %.2f s）",
+                        sim_now, sim_now - start_gate_ready_time_);
+        }
     }
 
     void MujocoRos2Control::publish_sim_time() {
@@ -284,6 +444,25 @@ namespace mujoco_ros2_control {
             }
         };
         thread_executor_spin_ = std::thread(spin);
+
+        // 启动门控的控制器状态轮询：必须放在独立线程里，
+        // 因为 switch_controller 期间 controller_manager 会持锁等 update() 把切换做完，
+        // 在仿真主循环里查询会互相卡死（spawner 5 s 超时）。
+        if (params_.start_gate_enabled && !params_.start_gate_controllers.empty()) {
+            start_gate_thread_ = std::thread(&MujocoRos2Control::start_gate_poll_loop, this);
+        } else {
+            start_gate_controllers_active_.store(true);
+        }
+    }
+
+    void MujocoRos2Control::start_gate_poll_loop() {
+        while (rclcpp::ok() && !stop_.load()) {
+            if (start_gate_controllers_active()) {
+                start_gate_controllers_active_.store(true);
+                return;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
     }
 
 

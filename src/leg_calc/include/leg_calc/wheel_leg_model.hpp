@@ -112,7 +112,7 @@ public:
   explicit WheelLegModel(const ModelParams & params);
 
   void setParams(const ModelParams & params);
-  const ModelParams & params() const { return params_; }
+  const ModelParams & params() const {return params_;}
 
   /// 折算后的等效平动质量 M_eff = M + Jw / r^2
   double effectiveCartMass() const;

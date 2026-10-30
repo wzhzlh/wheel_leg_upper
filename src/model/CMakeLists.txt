@@ -8,7 +8,8 @@ endif()
 find_package(ament_cmake REQUIRED)
 
 # 机器人描述与仿真资源（无编译目标，纯资源包；launch 统一在 launch_pack）
-install(DIRECTORY model config
+# meshes 必须一并安装，否则 URDF 里的 package://model/meshes/*.STL 找不到文件
+install(DIRECTORY model config meshes
   DESTINATION share/${PROJECT_NAME}
 )
 

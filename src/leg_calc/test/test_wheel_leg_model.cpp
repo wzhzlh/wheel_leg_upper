@@ -41,7 +41,8 @@ TEST(WheelLegModel, AnalyticLinearizationMatchesNumericJacobian)
       leg_calc::WheelLegModel::MatB B_num;
       model.linearizeNumeric(leg_calc::WheelLegModel::State::Zero(), u0, 1e-6, &A_num, &B_num);
 
-      const double scale = std::max(1.0, std::max(A.cwiseAbs().maxCoeff(), B.cwiseAbs().maxCoeff()));
+      const double scale =
+        std::max(1.0, std::max(A.cwiseAbs().maxCoeff(), B.cwiseAbs().maxCoeff()));
       EXPECT_LT((A - A_num).cwiseAbs().maxCoeff(), 1e-6 * scale);
       EXPECT_LT((B - B_num).cwiseAbs().maxCoeff(), 1e-6 * scale);
     }
@@ -122,6 +123,17 @@ TEST(LqrSolver, ProducesStableClosedLoop)
   EXPECT_LT(sol.riccati_residual, 1e-8);
   EXPECT_EQ(sol.gain.rows(), 1);
   EXPECT_EQ(sol.gain.cols(), 4);
+}
+
+TEST(LqrSolver, RejectsSingularInputWeight)
+{
+  leg_calc::WheelLegModel model(makeParams(leg_calc::InputMode::kWheelTorque));
+  leg_calc::WheelLegModel::MatA A;
+  leg_calc::WheelLegModel::MatB B;
+  model.linearize(&A, &B);
+  const auto solution = leg_calc::solveContinuousLqr(
+    A, B, Eigen::Matrix4d::Identity(), Eigen::Matrix<double, 1, 1>::Zero());
+  EXPECT_FALSE(solution.valid);
 }
 
 // 用非线性模型闭环仿真，验证线性 LQR 在原系统上确实能把摆杆扶起来

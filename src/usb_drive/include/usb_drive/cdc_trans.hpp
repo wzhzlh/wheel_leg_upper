@@ -28,7 +28,7 @@ namespace usb_drive
 class CdcTrans
 {
 public:
-  using RecvCallback = std::function<void(const uint8_t * data, int size)>;
+  using RecvCallback = std::function<void (const uint8_t * data, int size)>;
 
   CdcTrans();
   ~CdcTrans();
@@ -107,7 +107,7 @@ private:
 class FrameAssembler
 {
 public:
-  using FrameCallback = std::function<void(const uint8_t * frame, size_t size)>;
+  using FrameCallback = std::function<void (const uint8_t * frame, size_t size)>;
 
   FrameAssembler(size_t frame_size, FrameCallback callback);
 

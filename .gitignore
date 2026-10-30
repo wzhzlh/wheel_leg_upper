@@ -6,3 +6,8 @@ log/
 # Cursor / VS Code 本地索引数据库（体积巨大，切勿入库）
 .vscode/browse.vc.db*
 .vscode/ipch/
+.vscode/
+
+# Python 字节码
+__pycache__/
+*.pyc

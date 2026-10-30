@@ -1,183 +1,159 @@
-<?xml version="1.0" encoding="utf-8"?>
-<!--
-  双并腿轮足机器人 MuJoCo 模型（与 model/wheel_leg.urdf 一一对应）
-
-  外观按实机：橙色片状腿连杆 + 黑色机身 + 顶部黑色防护架 + 黑色蜂窝轮。
-
-  说明：
-    * 关节名、body 名、几何尺寸、质量均与 URDF 保持一致，
-      mujoco_ros2_control 通过“关节名”把 URDF 的 ros2_control 标签
-      映射到这里的 joint 上，名字写错会静默失去控制接口。
-    * base_link 带 <freejoint>，整机在仿真中是浮动的（可以倒、可以跑）。
-      URDF 无法描述浮动基座，因此 RViz 里 base_link 会被当作固定在世界原点，
-      真实位姿以 MuJoCo 窗口为准。
-    * 惯量由各 geom 的 mass + 形状自动合成，避免手写 diaginertia 的主轴排序问题；
-      同一 body 内各 geom 的 mass 之和等于 URDF 里该 link 的质量。
-    * 防护架、轮毂只做视觉（contype/conaffinity = 0），与 URDF 的 collision 声明一致。
-    * 执行器分两类：
-        position actuator -> mujoco_ros2_control 识别为 POSITION 接口（腿关节）
-        motor actuator    -> 识别为 EFFORT 接口（轮子）
-      注意 position actuator 不要加 kv，否则 biasprm[2] != 0，
-      不会被识别成 POSITION actuator，会退回插件内部的 PD 计算。
--->
 <mujoco model="wheel_leg">
-  <compiler angle="radian" autolimits="true"/>
-
-  <option gravity="0 0 -9.81" integrator="implicitfast" cone="elliptic" impratio="10"/>
-
-  <default>
-    <geom friction="1.2 0.01 0.0001" contype="1" conaffinity="1" rgba="0.3 0.3 0.34 1"/>
-  </default>
-
+  <compiler angle="radian" meshdir="../meshes" balanceinertia="true"/>
+  <option timestep="0.002" gravity="0 0 -9.81" integrator="implicitfast"/>
+  <asset>
+    <mesh name="base_link" file="base_link_simplified.STL"/>
+    <mesh name="lf_link1" file="lf_link1.STL"/>
+    <mesh name="lf_link2" file="lf_link2.STL"/>
+    <mesh name="lefoot_link" file="lefoot_link.STL"/>
+    <mesh name="lb_link1" file="lb_link1.STL"/>
+    <mesh name="lb_link2" file="lb_link2.STL"/>
+    <mesh name="rf_link1" file="rf_link1.STL"/>
+    <mesh name="rf_link2" file="rf_link2.STL"/>
+    <mesh name="rifoot_link" file="rifoot_link.STL"/>
+    <mesh name="rb_link1" file="rb_link1.STL"/>
+    <mesh name="rb_link2" file="rb_link2.STL"/>
+  </asset>
   <worldbody>
-    <!-- ==================== 机身（浮动基座） ==================== -->
-    <body name="base_link" pos="0 0 0.365">
-      <freejoint name="base_freejoint"/>
-
-      <!-- 主体：黑色电池/控制盒（0.24 x 0.20 x 0.10） -->
-      <geom name="base_geom" type="box" size="0.12 0.10 0.05" pos="0 0 0.07"
-            mass="0.85" rgba="0.07 0.07 0.08 1"/>
-
-      <!-- 顶部防护架：4 根立柱 -->
-      <geom name="post_fl" type="box" size="0.008 0.008 0.04" pos="0.09 0.07 0.16"
-            mass="0.02" rgba="0.07 0.07 0.08 1" contype="0" conaffinity="0"/>
-      <geom name="post_fr" type="box" size="0.008 0.008 0.04" pos="0.09 -0.07 0.16"
-            mass="0.02" rgba="0.07 0.07 0.08 1" contype="0" conaffinity="0"/>
-      <geom name="post_bl" type="box" size="0.008 0.008 0.04" pos="-0.09 0.07 0.16"
-            mass="0.02" rgba="0.07 0.07 0.08 1" contype="0" conaffinity="0"/>
-      <geom name="post_br" type="box" size="0.008 0.008 0.04" pos="-0.09 -0.07 0.16"
-            mass="0.02" rgba="0.07 0.07 0.08 1" contype="0" conaffinity="0"/>
-
-      <!-- 顶部防护架：前后横杆（沿 x） -->
-      <geom name="rail_top_y1" type="box" size="0.09 0.008 0.008" pos="0 0.07 0.20"
-            mass="0.0175" rgba="0.07 0.07 0.08 1" contype="0" conaffinity="0"/>
-      <geom name="rail_top_y2" type="box" size="0.09 0.008 0.008" pos="0 -0.07 0.20"
-            mass="0.0175" rgba="0.07 0.07 0.08 1" contype="0" conaffinity="0"/>
-
-      <!-- 顶部防护架：左右横杆（沿 y） -->
-      <geom name="rail_top_x1" type="box" size="0.008 0.07 0.008" pos="0.09 0 0.20"
-            mass="0.0175" rgba="0.07 0.07 0.08 1" contype="0" conaffinity="0"/>
-      <geom name="rail_top_x2" type="box" size="0.008 0.07 0.008" pos="-0.09 0 0.20"
-            mass="0.0175" rgba="0.07 0.07 0.08 1" contype="0" conaffinity="0"/>
-
-      <!-- IMU 安装点：与 URDF 的 imu_link 同位姿 -->
-      <body name="imu_link" pos="0 0 0.16">
-        <geom name="imu_geom" type="box" size="0.015 0.015 0.004" mass="0.01"
-              rgba="0.15 0.45 0.85 1" contype="0" conaffinity="0"/>
-        <site name="imu_site" pos="0 0 0" size="0.005"/>
-      </body>
-
-      <!-- ==================== 左腿 ==================== -->
-      <body name="leg_left_thigh" pos="0 0.10 0">
-        <joint name="leg_left_hip_joint" type="hinge" axis="0 1 0"
-               range="-1.30 1.30" damping="0.30"/>
-
-        <!-- 髋部橙色关节块 -->
-        <geom name="leg_left_hip_block" type="box" size="0.025 0.025 0.025" pos="0 0 -0.02"
-              mass="0.05" rgba="0.93 0.42 0.10 1"/>
-
-        <!-- 大腿：橙色片状连杆 -->
-        <geom name="leg_left_thigh_geom" type="box" size="0.0175 0.0225 0.065" pos="0 0 -0.075"
-              mass="0.30" rgba="0.93 0.42 0.10 1"/>
-
-        <body name="leg_left_shank" pos="0 0 -0.15">
-          <joint name="leg_left_knee_joint" type="hinge" axis="0 1 0"
-                 range="-2.60 0.10" damping="0.30"/>
-
-          <!-- 膝部橙色关节块 -->
-          <geom name="leg_left_knee_block" type="box" size="0.0225 0.025 0.0225" pos="0 0 -0.13"
-                mass="0.04" rgba="0.93 0.42 0.10 1"/>
-
-          <!-- 小腿：橙色片状连杆 -->
-          <geom name="leg_left_shank_geom" type="box" size="0.015 0.020 0.065" pos="0 0 -0.075"
-                mass="0.21" rgba="0.93 0.42 0.10 1"/>
-
-          <body name="wheel_left" pos="0 0 -0.15">
-            <joint name="wheel_left_joint" type="hinge" axis="0 1 0" damping="0.01"/>
-
-            <!-- 轮胎 -->
-            <geom name="wheel_left_geom" type="cylinder" size="0.065 0.0175" zaxis="0 1 0"
-                  mass="0.18" rgba="0.04 0.04 0.04 1" friction="1.6 0.02 0.0001"/>
-            <!-- 轮毂（纯视觉） -->
-            <geom name="wheel_left_hub" type="cylinder" size="0.045 0.019" zaxis="0 1 0"
-                  mass="0.02" rgba="0.55 0.55 0.58 1" contype="0" conaffinity="0"/>
+    <body name="base_link" pos="0 0 -0.8712" quat="0.707107 -0.707107 0.000000 0.000000">
+      <freejoint/>
+      <geom type="mesh" mesh="base_link" contype="0" conaffinity="0" group="2"/>
+      <geom name="base_col" type="box" size="0.033 0.06 0.112" pos="-0.003 -1.01 0.026" contype="1" conaffinity="1" group="3"/>
+      <inertial pos="-0.000800 -1.006000 0.026700" mass="1.667452" fullinertia="0.0014874528 0.0023873479 0.0013254287 -2.5793225e-08 -1.5191859e-05 -3.9095379e-07"/>
+      <site name="imu_site" pos="-0.000800 -1.006000 0.026700"/>
+      <body name="lf_link1" pos="0.029206 -1.034000 0.157680" quat="1.000000 0.000000 0.000000 0.000000">
+        <joint name="lf_joint1" type="hinge" pos="0.000000 0.000000 -0.015400" axis="0.000000 0.000000 -1.000000" damping="0.05" armature="2e-4" frictionloss="0.01" range="-2 2"/>
+        <geom type="mesh" mesh="lf_link1" pos="0.000000 0.000000 0.000000" contype="0" conaffinity="0" group="2"/>
+        <inertial pos="0.009484 0.014358 -0.010351" mass="0.022863" fullinertia="3.0468619e-06 2.1073965e-06 4.5913272e-06 1.1008175e-06 4.2842398e-09 6.5013675e-09"/>
+        <body name="lf_link2" pos="0.000000 0.000000 0.000000" quat="1.000000 0.000000 0.000000 0.000000">
+          <joint name="lf_joint2" type="hinge" pos="0.027600 0.041700 -0.008300" axis="0.000000 0.000000 -1.000000" damping="0.05" armature="2e-4" frictionloss="0.005" range="-3.1416 3.1416"/>
+          <!-- 最新一次 CAD 导出（2026-10）后，lf_link2 的网格原点改到了膝轴（yaw +0.987 rad），
+               本 body 仍在髋轴处，故网格要平移+旋转回原位置；其余三个 link2 网格原点未变。
+               <inertial> 也换回了髋系；注意导出文件的惯量张量旋转方向与 CoM 相反（导出器 bug），
+               这里用逆旋转，数值与旧版一致，只是 CoM 用了新数据。 -->
+          <geom type="mesh" mesh="lf_link2" pos="0.0275573 0.0417204 0.000000" quat="0.880666 0.000000 0.000000 0.473737" contype="0" conaffinity="0" group="2"/>
+          <inertial pos="-0.036887 0.108239 -0.010320" mass="0.035533" fullinertia="1.2980508e-05 1.2474917e-05 2.5244e-05 -8.1449567e-06 1.044024e-07 4.0046251e-08"/>
+          <body name="lefoot_link" pos="-0.045400 0.117300 -0.008300" quat="0.389968 0.000000 0.000000 0.920829">
+            <!-- 轮子关节 armature 只加 2e-5（最新一次 CAD 导出后网格 izz=2.34e-5，约 0.85 倍；
+                 等效平动质量 = armature / r² ≈ 0.02 kg，r=0.03），
+                 目的是给轮速环留稳定性余量（sim_bridge 的纯 P 要求 kp < 2J/Δt，
+                 J = 2.34e-5 + 2e-5 = 4.3e-5，上限约 0.043，kp=0.02 有一倍余量）。
+                 别再往上加：等效平动质量会被 leg_control 的 cart_mass 误判。 -->
+            <!-- 正轮速对应世界系 +X 无滑滚动，两轮世界转轴均指向 +Y。
+                 注意：URDF（CAD 原样）里左轮轴是 -z、右轮是 -z（右腿带 180° 翻转），
+                 世界系下一正一反（实机上两个 M2006 是镜像装的，靠固件翻一个的符号）。
+                 这里把左轮翻成 +z，让两台轮子在 MuJoCo 里同向 ——
+                 sim_bridge 是逐轮 PI（err = ref - meas），左右反向会成为正反馈。 -->
+            <joint name="lefoot_joint" type="hinge" pos="0.000000 0.000000 -0.007600" axis="0.000000 0.000000 1.000000" damping="0.02" armature="2e-5" frictionloss="0.002"/>
+            <!-- 闭环闭合点 2：轮轴中心（= 轮子旋转关节的轴线上） -->
+            <site name="lefoot_axle" pos="0 0 0" size="0.004" rgba="1 0.2 0.2 0.6"/>
+            <geom type="mesh" mesh="lefoot_link" pos="0.000000 0.000000 0.029800" contype="0" conaffinity="0" group="2"/>
+            <geom name="lefoot_col" type="cylinder" size="0.032 0.012" pos="0 0 0.0252" contype="1" conaffinity="1" group="3"/>
+            <inertial pos="-0.000213 0.000781 -0.004942" mass="0.130114" fullinertia="1.5509364e-05 1.5266086e-05 2.3391923e-05 -6.3006105e-08 -5.3442975e-10 2.1543526e-09"/>
           </body>
         </body>
       </body>
-
-      <!-- ==================== 右腿 ==================== -->
-      <body name="leg_right_thigh" pos="0 -0.10 0">
-        <joint name="leg_right_hip_joint" type="hinge" axis="0 1 0"
-               range="-1.30 1.30" damping="0.30"/>
-
-        <geom name="leg_right_hip_block" type="box" size="0.025 0.025 0.025" pos="0 0 -0.02"
-              mass="0.05" rgba="0.93 0.42 0.10 1"/>
-
-        <geom name="leg_right_thigh_geom" type="box" size="0.0175 0.0225 0.065" pos="0 0 -0.075"
-              mass="0.30" rgba="0.93 0.42 0.10 1"/>
-
-        <body name="leg_right_shank" pos="0 0 -0.15">
-          <joint name="leg_right_knee_joint" type="hinge" axis="0 1 0"
-                 range="-2.60 0.10" damping="0.30"/>
-
-          <geom name="leg_right_knee_block" type="box" size="0.0225 0.025 0.0225" pos="0 0 -0.13"
-                mass="0.04" rgba="0.93 0.42 0.10 1"/>
-
-          <geom name="leg_right_shank_geom" type="box" size="0.015 0.020 0.065" pos="0 0 -0.075"
-                mass="0.21" rgba="0.93 0.42 0.10 1"/>
-
-          <body name="wheel_right" pos="0 0 -0.15">
-            <joint name="wheel_right_joint" type="hinge" axis="0 1 0" damping="0.01"/>
-
-            <geom name="wheel_right_geom" type="cylinder" size="0.065 0.0175" zaxis="0 1 0"
-                  mass="0.18" rgba="0.04 0.04 0.04 1" friction="1.6 0.02 0.0001"/>
-            <geom name="wheel_right_hub" type="cylinder" size="0.045 0.019" zaxis="0 1 0"
-                  mass="0.02" rgba="0.55 0.55 0.58 1" contype="0" conaffinity="0"/>
+      <body name="lb_link1" pos="-0.030794 -1.034000 0.152180" quat="1.000000 0.000000 0.000000 0.000000">
+        <joint name="lb_joint1" type="hinge" pos="0.000000 0.000000 -0.007900" axis="0.000000 0.000000 -1.000000" damping="0.05" armature="2e-4" frictionloss="0.01" range="-2 2"/>
+        <geom type="mesh" mesh="lb_link1" pos="0.000000 0.000000 0.000000" contype="0" conaffinity="0" group="2"/>
+        <inertial pos="-0.013393 0.009140 -0.005684" mass="0.015741" fullinertia="1.6916018e-06 2.5641001e-06 4.0488501e-06 -1.1145109e-06 6.4307882e-09 -4.3804554e-09"/>
+        <body name="lb_link2" pos="-0.041299 0.028185 0.010000" quat="0.294991 0.000000 0.000000 0.955500">
+          <joint name="lb_joint2" type="hinge" pos="0.000000 0.000000 -0.003500" axis="0.000000 0.000000 -1.000000" damping="0.05" armature="2e-4" frictionloss="0.005" range="-3.1416 3.1416"/>
+          <geom type="mesh" mesh="lb_link2" pos="0.000000 0.000000 0.000000" contype="0" conaffinity="0" group="2"/>
+          <inertial pos="0.003414 -0.088388 -0.005280" mass="0.044132" fullinertia="2.9415393e-05 5.7652337e-06 3.479591e-05 -9.1005734e-07 2.4081464e-08 -6.2231857e-07"/>
+          <!-- 闭环闭合点 1：后摇杆末端（= 轮轴中心在本体坐标下量出来的点） -->
+          <site name="lb_rocker_axle" pos="0.004066 -0.105117 -0.012800" size="0.004" rgba="1 0.2 0.2 0.6"/>
+        </body>
+      </body>
+      <body name="rf_link1" pos="0.029206 -1.034000 -0.104320" quat="-0.000004 1.000000 0.000000 0.000000">
+        <joint name="rf_joint1" type="hinge" pos="0.000000 0.000000 -0.015600" axis="0.000000 0.000000 -1.000000" damping="0.05" armature="2e-4" frictionloss="0.01" range="-2 2"/>
+        <geom type="mesh" mesh="rf_link1" pos="0.000000 0.000000 0.000000" contype="0" conaffinity="0" group="2"/>
+        <inertial pos="0.008570 -0.014922 -0.010351" mass="0.022863" fullinertia="3.1803074e-06 1.9739509e-06 4.5913273e-06 -1.0337427e-06 3.8793182e-09 -6.7358355e-09"/>
+        <body name="rf_link2" pos="0.024901 -0.043359 0.000000" quat="0.865449 0.000000 0.000000 -0.500997">
+          <joint name="rf_joint2" type="hinge" pos="0.000000 0.000000 0.000000" axis="0.000000 0.000000 -1.000000" damping="0.05" armature="2e-4" frictionloss="0.005" range="-3.1416 3.1416"/>
+          <geom type="mesh" mesh="rf_link2" pos="0.000000 0.000000 0.000000" contype="0" conaffinity="0" group="2"/>
+          <inertial pos="0.041277 -0.082909 -0.004354" mass="0.035533" fullinertia="1.76353e-05 7.8201242e-06 2.5244001e-05 -6.5053667e-06 4.9824087e-08 -1.0008519e-07"/>
+          <body name="rifoot_link" pos="0.046800 -0.094000 -0.004300" quat="0.850190 0.000000 0.000000 -0.526476">
+            <!-- 右腿局部 z 轴与左腿反向，故局部关节轴取 -z。 -->
+            <joint name="rifoot_joint" type="hinge" pos="0.000000 0.000000 -0.010900" axis="0.000000 0.000000 -1.000000" damping="0.02" armature="2e-5" frictionloss="0.002"/>
+            <!-- 闭环闭合点 2：轮轴中心 -->
+            <site name="rifoot_axle" pos="0 0 0" size="0.004" rgba="1 0.2 0.2 0.6"/>
+            <geom type="mesh" mesh="rifoot_link" pos="0.000000 0.000000 0.025800" contype="0" conaffinity="0" group="2"/>
+            <geom name="rifoot_col" type="cylinder" size="0.032 0.012" pos="0 0 0.0212" contype="1" conaffinity="1" group="3"/>
+            <inertial pos="-0.000203 -0.000477 -0.007159" mass="0.155050" fullinertia="1.8771313e-05 1.8594572e-05 2.9826085e-05 1.0462708e-07 -9.5872849e-10 -2.0983033e-09"/>
           </body>
+        </body>
+      </body>
+      <body name="rb_link1" pos="-0.030794 -1.034000 -0.098816" quat="-0.000004 1.000000 0.000000 0.000000">
+        <joint name="rb_joint1" type="hinge" pos="0.000000 0.000000 -0.008000" axis="0.000000 0.000000 -1.000000" damping="0.05" armature="2e-4" frictionloss="0.01" range="-2 2"/>
+        <geom type="mesh" mesh="rb_link1" pos="0.000000 0.000000 0.000000" contype="0" conaffinity="0" group="2"/>
+        <inertial pos="-0.009157 -0.013382 -0.005684" mass="0.015741" fullinertia="2.5613286e-06 1.6943735e-06 4.04885e-06 1.1155919e-06 4.3890661e-09 6.4314258e-09"/>
+        <body name="rb_link2" pos="-0.028236 -0.041264 0.000000" quat="0.466515 0.000000 0.000000 -0.884513">
+          <joint name="rb_joint2" type="hinge" pos="0.000000 0.000000 0.006500" axis="0.000000 0.000000 -1.000000" damping="0.05" armature="2e-4" frictionloss="0.005" range="-3.1416 3.1416"/>
+          <geom type="mesh" mesh="rb_link2" pos="0.000000 0.000000 0.000000" contype="0" conaffinity="0" group="2"/>
+          <inertial pos="0.036081 0.080760 0.004721" mass="0.044132" fullinertia="2.5499959e-05 9.6806107e-06 3.4795919e-05 8.8372722e-06 2.5395808e-07 5.6852231e-07"/>
+          <!-- 闭环闭合点 1：后摇杆末端 -->
+          <site name="rb_rocker_axle" pos="0.042835 0.095870 0.001204" size="0.004" rgba="1 0.2 0.2 0.6"/>
         </body>
       </body>
     </body>
   </worldbody>
-
-  <!-- 相邻连杆之间不做碰撞检测（腿片与关节块天然相交） -->
   <contact>
-    <exclude body1="base_link" body2="leg_left_thigh"/>
-    <exclude body1="base_link" body2="leg_right_thigh"/>
-    <exclude body1="leg_left_thigh" body2="leg_left_shank"/>
-    <exclude body1="leg_right_thigh" body2="leg_right_shank"/>
-    <exclude body1="leg_left_shank" body2="wheel_left"/>
-    <exclude body1="leg_right_shank" body2="wheel_right"/>
+    <exclude body1="base_link" body2="lefoot_link"/>
+    <exclude body1="base_link" body2="rifoot_link"/>
+    <exclude body1="lefoot_link" body2="rifoot_link"/>
   </contact>
+  <equality>
+    <!--
+      五连杆闭环：后摇杆(rocker)末端 == 轮轴中心。
 
+      这里改成 site1/site2 而不是 body1/body2 + anchor：
+      * anchor 是用 body2 的局部系解释的，手写 CAD 里量出来的数字极容易差一个坐标系，
+        初始就带一截约束误差，一上电就被约束力拽飞；
+      * site 的位置可以在 GUI 里看到，闭链点是不是真的重合一眼就能判断；
+      * 两个 site 在 qpos=0 时严格重合（残差 1e-9 量级），所以启动瞬间不会有力冲击。
+      * 闭环本身是平面机构（所有 hinge 轴都平行于 base 的 z 轴），
+        connect 给出的 3 条约束里那条"面外"约束是相容的冗余，不会和接触打架。
+    -->
+    <connect name="left_close" site1="lb_rocker_axle" site2="lefoot_axle"
+             solref="0.01 1" solimp="0.9 0.95 0.005"/>
+    <connect name="right_close" site1="rb_rocker_axle" site2="rifoot_axle"
+             solref="0.01 1" solimp="0.9 0.95 0.005"/>
+  </equality>
   <actuator>
-    <!-- 腿关节：位置伺服，ctrl = 目标关节角 [rad] -->
-    <position name="leg_left_hip_act" joint="leg_left_hip_joint" kp="30"
-              ctrllimited="true" ctrlrange="-1.30 1.30"
-              forcelimited="true" forcerange="-12 12"/>
-    <position name="leg_left_knee_act" joint="leg_left_knee_joint" kp="30"
-              ctrllimited="true" ctrlrange="-2.60 0.10"
-              forcelimited="true" forcerange="-12 12"/>
-    <position name="leg_right_hip_act" joint="leg_right_hip_joint" kp="30"
-              ctrllimited="true" ctrlrange="-1.30 1.30"
-              forcelimited="true" forcerange="-12 12"/>
-    <position name="leg_right_knee_act" joint="leg_right_knee_joint" kp="30"
-              ctrllimited="true" ctrlrange="-2.60 0.10"
-              forcelimited="true" forcerange="-12 12"/>
-
-    <!-- 轮子：力矩直通，ctrl = 轮轴力矩 [N*m]，与 LQR 的 u 同一量纲 -->
-    <motor name="wheel_left_act" joint="wheel_left_joint" gear="1"
-           ctrllimited="true" ctrlrange="-3 3"/>
-    <motor name="wheel_right_act" joint="wheel_right_joint" gear="1"
-           ctrllimited="true" ctrlrange="-3 3"/>
+    <motor name="lf_joint1_act" joint="lf_joint1" ctrlrange="-12 12"/>
+    <motor name="lb_joint1_act" joint="lb_joint1" ctrlrange="-12 12"/>
+    <motor name="rf_joint1_act" joint="rf_joint1" ctrlrange="-12 12"/>
+    <motor name="rb_joint1_act" joint="rb_joint1" ctrlrange="-12 12"/>
+    <motor name="lefoot_joint_act" joint="lefoot_joint" ctrlrange="-3 3"/>
+    <motor name="rifoot_joint_act" joint="rifoot_joint" ctrlrange="-3 3"/>
   </actuator>
-
   <sensor>
-    <!-- 挂到 imu_site 上，插件会把它注册成 IMU（话题 <node>/imu） -->
     <gyro name="imu_gyro" site="imu_site"/>
-    <accelerometer name="imu_accel" site="imu_site"/>
-
-    <!-- 机身世界位姿，可用于把仿真 odom 桥接给 leg_calc -->
-    <framepos name="base_link_pos" objtype="body" objname="base_link"/>
-    <framequat name="base_link_quat" objtype="body" objname="base_link"/>
+    <accelerometer name="imu_acc" site="imu_site"/>
+    <framepos name="base_pos" objtype="site" objname="imu_site"/>
+    <framequat name="base_quat" objtype="site" objname="imu_site"/>
   </sensor>
+
+  <!--
+    home：唯一权威的初始位姿（插件用 mj_resetDataKeyframe 加载，不是 mj_resetData）。
+
+    为什么需要它：
+    1) hinge 的 qpos0 恒等于 0，机身高度又只由 base_link 的 pos 决定；
+       也就是说"不加 keyframe"时，初始姿态是隐式的、只能关节全 0。
+       想要任何别的初始姿态，keyframe 是 MuJoCo 唯一的入口。
+    2) CAD 导出的左右腿几何并不完全对称：关节全 0 时左轮比右轮高 13.5 mm
+       （实测 gap L=0.01350 / R=0.00004），一释放就是"单轮着地、侧倾 3°"
+       的冲击，姿态角速度尖峰能到 4.5 rad/s，足够触发 leg_control 的 max_pitch_rate=6.0。
+    3) 这里把右腿曲柄补偿 -0.2259 / +0.2301 rad（闭环被动关节由约束解出，残差 2e-13），
+       把右轮抬到与左轮同高，再把机身整体下移 13.5 mm → 两轮同时、零速度着地。
+
+    数值来源：用 FK 反解 + 数值雅可比牛顿迭代（目标 gap_R=gap_L=0.01350、轮轴 x 不变）。
+    以后改了任何连杆尺寸，这两组数要重算；验收标准见 teach.md 12.10。
+  -->
+  <keyframe>
+    <!-- qpos 顺序：free joint(7) + 按声明顺序的 10 个 hinge -->
+    <!--              x  y      z       qw      qx       qy  qz   lf1 lf2 lefoot lb1 lb2   rf1       rf2       rifoot rb1       rb2 -->
+    <key name="home" qpos="0  0  -0.884700  0.707107 -0.707107 0   0    0   0   0      0   0    -0.225943 0.333931  0      0.230087 -0.330171"/>
+  </keyframe>
 </mujoco>

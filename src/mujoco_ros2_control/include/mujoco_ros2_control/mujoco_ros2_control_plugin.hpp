@@ -82,6 +82,7 @@
 #include "hardware_interface/types/hardware_interface_type_values.hpp"
 
 // msgs
+#include "lifecycle_msgs/msg/state.hpp"
 #include "std_msgs/msg/bool.hpp"
 #include "std_msgs/msg/float64_multi_array.hpp"
 #include "geometry_msgs/msg/pose.hpp"
@@ -175,6 +176,40 @@ namespace mujoco_ros2_control
         void publish_sim_time();
 
         /**
+         * @brief 推进一步仿真：启动门控未放开时用"挂架"夹住躯干，放开后才是自由积分。
+         *
+         * 挂架期间照常积分、照常推进仿真时钟，只是每步把机身按回初始位姿，
+         * 保证 /clock、joint_states、IMU 正常发布，腿和轮子按控制器指令真实运动，
+         * 上层控制节点（leg_control）能走完自检并在释放瞬间不打滑。
+         */
+        void step_simulation();
+
+        /**
+         * @brief 把机身（free joint）按回挂架初始位姿并清零机身速度。
+         */
+        void clamp_base_to_hold_pose();
+
+        /**
+         * @brief 检查启动门控条件（控制器是否全部 active + 额外保持时间），满足后放开物理步进。
+         */
+        void update_start_gate();
+
+        /**
+         * @brief 门控要求的控制器是否全部处于 active 状态。
+         *
+         * @note 这个函数会去问 controller_manager，而 controller_manager 正在执行
+         *       switch_controller 时会一直持锁等到 update() 里把切换做完。
+         *       所以它只能在独立的轮询线程里调用，绝不能在仿真的 update() 线程里调用，
+         *       否则 update() 被卡住 → 控制器永远切不过去 → spawner 5 s 超时。
+         */
+        bool start_gate_controllers_active();
+
+        /**
+         * @brief 独立的门控轮询线程：控制器全部 active 后把 start_gate_controllers_active_ 置位。
+         */
+        void start_gate_poll_loop();
+
+        /**
          * @brief Initializes the controller manager and hardware interfaces.
          *
          * This method initializes the controller manager and sets up the hardware interfaces for communication between the
@@ -222,6 +257,9 @@ namespace mujoco_ros2_control
         double pub_clock_frequency_; ///< Frequency the Clock is published
         double last_pub_clock_time_; ///< Timestamp the clock was published
 
+        ///< 启动门控状态（latched）：true=挂架已放开、允许轮子出力/自由积分
+        rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr start_gate_publisher_;
+
         // Mujoco-related variables
         mjModel* mujoco_model_{}; ///< Pointer to the Mujoco model
         mjData* mujoco_data_{}; ///< Pointer to the Mujoco data
@@ -239,6 +277,14 @@ namespace mujoco_ros2_control
         rclcpp::Duration control_period_ = rclcpp::Duration(1, 0); ///< Control period of the controller manager
         std::atomic<bool> stop_ = false; ///< Flag to stop the execution of the controller manager
         std::thread thread_executor_spin_; ///< Thread for the controller manager executor
+
+        // 启动门控状态
+        double hold_base_qpos_[7] = {0, 0, 0, 1, 0, 0, 0}; ///< 挂架保持的机身位姿（free joint qpos）
+        std::atomic<bool> start_gate_controllers_active_{false}; ///< 控制器是否已全部 active（轮询线程写，仿真线程读）
+        std::thread start_gate_thread_; ///< 门控轮询线程
+        bool start_gate_opened_ = false; ///< 门控是否已放开（放开后才真正积分物理）
+        bool start_gate_timeout_warned_ = false; ///< 超时强制放开是否已告警
+        double start_gate_ready_time_ = -1.0; ///< 所有控制器 active 的时刻 [仿真时间]，<0 表示还没到
 
         // Visualization class
 

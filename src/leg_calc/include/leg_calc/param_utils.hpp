@@ -15,6 +15,8 @@
 
 #include <Eigen/Dense>
 
+#include <algorithm>
+#include <cmath>
 #include <map>
 #include <stdexcept>
 #include <string>
@@ -50,12 +52,13 @@ inline rclcpp::Parameter lookupParam(
 
 /// 声明模型参数：cart_mass / pendulum_mass / com_length / com_inertia /
 /// gravity / wheel_radius / wheel_inertia / input_mode
-inline void declareModelParams(rclcpp::Node & node)
+inline void declareModelParams(
+  rclcpp::Node & node, double com_length_default = ModelParams{}.com_length)
 {
   const ModelParams defaults;
   node.declare_parameter("cart_mass", defaults.cart_mass);
   node.declare_parameter("pendulum_mass", defaults.pendulum_mass);
-  node.declare_parameter("com_length", defaults.com_length);
+  node.declare_parameter("com_length", com_length_default);
   node.declare_parameter("com_inertia", defaults.com_inertia);
   node.declare_parameter("gravity", defaults.gravity);
   node.declare_parameter("wheel_radius", defaults.wheel_radius);
@@ -101,6 +104,12 @@ inline void readLqrWeights(
     throw std::invalid_argument("q_diag 必须包含 4 个元素");
   }
   const double r_weight = detail::lookupParam(node, pending, "r_weight").as_double();
+  if (!std::isfinite(r_weight) || !(r_weight > 0.0) ||
+    std::any_of(q_diag.begin(), q_diag.end(),
+    [](double q) {return !std::isfinite(q) || q < 0.0;}))
+  {
+    throw std::invalid_argument("q_diag 必须有限且非负，r_weight 必须有限且为正");
+  }
 
   *Q = Eigen::VectorXd::Map(
     q_diag.data(), static_cast<Eigen::Index>(q_diag.size())).asDiagonal();

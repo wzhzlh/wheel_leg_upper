@@ -25,10 +25,12 @@ std::vector<uint8_t> makePattern(size_t count, uint8_t start = 0)
 TEST(DataPackLayout, MatchesFirmware)
 {
   EXPECT_EQ(sizeof(usb_drive::Wheel_t), 8u);
+  EXPECT_EQ(sizeof(usb_drive::WheelTarget_t), 12u);
   EXPECT_EQ(sizeof(usb_drive::JointTarget_t), 20u);
   EXPECT_EQ(sizeof(usb_drive::JointState_t), 48u);
-  EXPECT_EQ(sizeof(usb_drive::RobotTarget_t), 96u);
+  EXPECT_EQ(sizeof(usb_drive::RobotTarget_t), 104u);
   EXPECT_EQ(sizeof(usb_drive::RobotState_t), 208u);
+  EXPECT_EQ(offsetof(usb_drive::RobotTarget_t, joint), 24u);
 
   // 关节反馈中 uint64_t 会引入 4 B 填充，偏移必须与固件一致
   EXPECT_EQ(offsetof(usb_drive::JointState_t, error), 32u);

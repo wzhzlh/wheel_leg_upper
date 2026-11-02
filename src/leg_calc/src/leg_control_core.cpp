@@ -40,8 +40,13 @@ void LegController::reset()
 {
   safety_.reset();
   balance_omega_state_ = {{0.0, 0.0}};
+  wheel_torque_state_ = {{0.0, 0.0}};
   com_height_cmd_ = com_height_target_;
   com_height_ = config_.model.com_length;
+  x_ref_ = 0.0;
+  yaw_rate_filt_ = 0.0;
+  vel_i_ = 0.0;
+  yaw_i_ = 0.0;
 }
 
 ControlOutput LegController::step(const StateSnapshot & snapshot, double dt)
@@ -75,12 +80,38 @@ ControlOutput LegController::step(const StateSnapshot & snapshot, double dt)
 
   if (status.balance_enabled) {
     updateComHeightTarget(snapshot.command, dt);
-    out.u = computeBalanceTorque(snapshot, gain);
+    if (config_.wheel_torque_enable) {
+      // 力矩前馈模式下 LQR 才吃速度/位置参考（否则会和固件的速度环叠成两级速度环）
+      updatePositionReference(snapshot, status, dt);
+    }
+    out.u = computeBalanceTorque(snapshot, gain, status.command_fresh);
     out.joint_torque = computeJointTorques(snapshot);
+    // 下位机运控模式要的“位置目标”：由足端目标 IK 得到，kp/kd 非 0 时才真正起作用
+    out.joint_position_target = computeJointPositionTarget(snapshot);
+    out.joint_target_valid = out.joint_position_target[0] != 0.0 ||
+      out.joint_position_target[1] != 0.0 ||
+      out.joint_position_target[2] != 0.0 ||
+      out.joint_position_target[3] != 0.0;
+    // 主通道：轮速目标（固件位置外环 + 速度内环执行）
     out.wheel_omega_ref = computeWheelSpeeds(status, snapshot, out.u, dt);
+    // 可选的力矩前馈（默认关）
+    out.wheel_torque_ref = config_.wheel_torque_enable ?
+      computeWheelTorques(status, snapshot, out.u, dt) :
+      std::array<double, 2>{{0.0, 0.0}};
   } else {
-    // 未使能 / 故障：关节失力、轮子位置保持（ω_ref 全零），并清掉平衡分量状态
+    // 未使能 / 故障：关节失力；轮速目标归零 → 固件位置环把轮子锁在当前角度
+    // （力矩前馈模式没有位置环可用，才退化成 −wheel_brake_damp·ω 阻尼）
     balance_omega_state_ = {{0.0, 0.0}};
+    vel_i_ = 0.0;
+    yaw_i_ = 0.0;
+    if (config_.wheel_torque_enable) {
+      for (size_t i = 0; i < 2; ++i) {
+        out.wheel_torque_ref[i] = std::clamp(
+          -config_.wheel_brake_damp * snapshot.wheel_omega[i],
+          -config_.wheel_torque_max, config_.wheel_torque_max);
+      }
+      wheel_torque_state_ = out.wheel_torque_ref;
+    }
   }
 
   out.com_height = com_height_;
@@ -135,16 +166,72 @@ double LegController::computeComHeight(const StateSnapshot & snapshot) const
   return y_sum / static_cast<double>(valid_legs) + config_.leg_geometry.com_offset;
 }
 
+void LegController::updatePositionReference(
+  const StateSnapshot & snapshot, const SafetyStatus & status, double dt)
+{
+  // 速度跟踪：参考速度由上层给（已限幅），位置参考跟着当前位置走，这样 LQR 只调节
+  // “速度误差 + 俯仰”，不会把前进当成位置偏差再拉回来（否则走不动）。
+  // 只有力矩前馈模式（wheel_torque_enable=true）才需要这里的参考：
+  // 速度通道下行驶由 computeWheelSpeeds 的差速项负责，LQR 不该再吃速度误差。
+  const double v_des = (status.command_fresh && snapshot.command.enable) ?
+    snapshot.command.linear_velocity : 0.0;
+  constexpr double kDrivingThreshold = 1e-3;   // [m/s] 小于这个值就当“停车”
+  // 行驶时位置参考跟着当前位置走；停车后“原地冻结”（不往原点拉），
+  // 否则跑出去几米后一停车，x 误差会直接顶到 ±u_max 猛刹，反而容易触发姿态故障。
+  if (std::abs(v_des) > kDrivingThreshold) {
+    x_ref_ = snapshot.x;
+  }
+  (void)dt;
+}
+
 double LegController::computeBalanceTorque(
-  const StateSnapshot & snapshot, const GainSchedule::Gain & gain) const
+  const StateSnapshot & snapshot, const GainSchedule::Gain & gain, bool command_fresh) const
 {
   WheelLegModel::State state;
   state << snapshot.x, snapshot.pitch, snapshot.x_dot, snapshot.pitch_rate;
   WheelLegModel::State ref = WheelLegModel::State::Zero();
   ref(kTheta) = snapshot.command.pitch_target;
+  if (config_.wheel_torque_enable) {
+    // 力矩前馈模式：LQR 自己承担速度跟踪（x/ẋ 参考）
+    ref(kX) = x_ref_;
+    // 命令不新鲜时归零，避免超时后继续加速
+    ref(kXdot) = command_fresh ? snapshot.command.linear_velocity : 0.0;
+  } else {
+    // 速度通道模式：LQR 只做姿态，位置/速度误差项必须**置零误差**而不是"目标=原点"。
+    // 这里踩过坑：写 ref(kX)=0 的字面含义是"把 x 拉回 0 m"，而 snapshot.x 是轮子
+    // 多圈绝对转角×r（没有起点锚定），跑一会儿就是几米 —— x 误差直接把 u 顶到 u_max，
+    // 转换成轮速目标后轮子朝同一个方向一直转，而且越转 x 越大，正反馈跑飞。
+    // 正确做法：参考值跟随实测值（误差 0），行驶交给 /wheel_target 的差速项，
+    // 速度稳态由固件速度环的积分负责。
+    ref(kX) = snapshot.x;
+    ref(kXdot) = snapshot.x_dot;
+  }
 
   const double u = -(gain * (state - ref))(0, 0);
   return std::clamp(u, -config_.u_max, config_.u_max);
+}
+
+std::array<double, 4> LegController::computeJointPositionTarget(
+  const StateSnapshot & snapshot) const
+{
+  std::array<double, 4> q_target{{0.0, 0.0, 0.0, 0.0}};
+  const double foot_y_target = com_height_cmd_ - config_.leg_geometry.com_offset;
+  const Eigen::Vector2d foot_target(config_.foot_target_x, foot_y_target);
+
+  for (int leg = 0; leg < 2; ++leg) {
+    const size_t i0 = static_cast<size_t>(2 * leg);
+    // 用当前姿态当种子选装配分支，保证目标角与实测角连续（不会突然翻肘）
+    Eigen::Vector2d q_seed = legJointAngles(snapshot, leg);
+    Eigen::Vector2d alpha_beta;
+    if (!config_.fivebar.inverseKinematics(foot_target, &alpha_beta, &q_seed)) {
+      continue;   // 超出工作空间：保持 0，配合 kp=0 时无影响
+    }
+    // α/β = joint_sign·q + joint_offset  →  q = joint_sign·(α/β − joint_offset)
+    q_target[i0] = config_.joint_sign[i0] * (alpha_beta(0) - config_.joint_offset[i0]);
+    q_target[i0 + 1] =
+      config_.joint_sign[i0 + 1] * (alpha_beta(1) - config_.joint_offset[i0 + 1]);
+  }
+  return q_target;
 }
 
 std::array<double, 4> LegController::computeJointTorques(const StateSnapshot & snapshot) const
@@ -186,13 +273,16 @@ std::array<double, 4> LegController::computeJointTorques(const StateSnapshot & s
 std::array<double, 2> LegController::computeWheelSpeeds(
   const SafetyStatus & status, const StateSnapshot & snapshot, double u, double dt)
 {
+  // 实机主通道：固件轮子是"位置外环 + 速度内环"的双环 PID，只接速度目标。
+  //   ω_ref = 平衡分量（LQR 力矩折算） + 差速行驶分量（v/r ± 0.5·L·ω/r）
+  // 仿真桥 sim_bridge 也消费这条通道（它内部再用力矩环跟踪 ω_ref）。
   std::array<double, 2> omega_ref{{0.0, 0.0}};
 
   const double balance_omega = std::clamp(
     u * config_.balance_torque_to_omega,
     -config_.max_balance_omega, config_.max_balance_omega);
 
-  // 只有 RAW 且命令新鲜时才跟踪速度；降级状态速度目标归零
+  // 只有 RUN 且命令新鲜时才跟踪速度；降级状态速度/偏航目标归零
   const bool tracking = (status.state == ControlState::kRun) && status.command_fresh;
   const double v_des = tracking ? std::clamp(
     snapshot.command.linear_velocity,
@@ -200,26 +290,94 @@ std::array<double, 2> LegController::computeWheelSpeeds(
   const double w_des = tracking ? std::clamp(
     snapshot.command.yaw_rate, -config_.max_yaw_rate, config_.max_yaw_rate) : 0.0;
 
+  // 差速运动学：ω > 0 为左转 → 左轮慢、右轮快
+  const double half_track = 0.5 * config_.wheel_separation;
   const double drive[2] = {
     std::clamp(
-      (v_des - 0.5 * config_.wheel_separation * w_des) / config_.wheel_radius,
+      (v_des - half_track * w_des) / config_.wheel_radius,
       -config_.max_drive_omega, config_.max_drive_omega),
     std::clamp(
-      (v_des + 0.5 * config_.wheel_separation * w_des) / config_.wheel_radius,
+      (v_des + half_track * w_des) / config_.wheel_radius,
       -config_.max_drive_omega, config_.max_drive_omega)
   };
 
-  // 一阶漏积分：平衡分量按轮速目标缓变，避免 LQR 输出突变直接打到速度环
+  // 一阶漏积分：平衡分量缓变，避免 LQR 输出突变直接打到速度环
   constexpr double kBalanceLeakPerS = 6.0;
-  const double leak_rate = (config_.balance_leak_rate > 0.0) ? config_.balance_leak_rate : kBalanceLeakPerS;
+  const double leak_rate =
+    (config_.balance_leak_rate > 0.0) ? config_.balance_leak_rate : kBalanceLeakPerS;
+  const double alpha = std::clamp(leak_rate * std::max(0.0, dt), 0.0, 1.0);
   for (size_t i = 0; i < 2; ++i) {
     const double target = balance_omega + drive[i];
-    const double alpha = std::clamp(leak_rate * std::max(0.0, dt), 0.0, 1.0);
     balance_omega_state_[i] += alpha * (target - balance_omega_state_[i]);
     omega_ref[i] = std::clamp(
       balance_omega_state_[i], -config_.max_wheel_omega, config_.max_wheel_omega);
   }
+
+  // 偏航角速度一阶低通（20 Hz）：力矩前馈通道的 k_yaw_p 要用，每周期更新一次。
+  // IMU 200 Hz 更新，原始值直接进 P 会把高频噪声放大成俯仰扰动。
+  const double yaw_alpha = std::clamp(dt / (dt + 0.008), 0.0, 1.0);
+  yaw_rate_filt_ += yaw_alpha * (snapshot.yaw_rate - yaw_rate_filt_);
   return omega_ref;
+}
+
+std::array<double, 2> LegController::computeWheelTorques(
+  const SafetyStatus & status, const StateSnapshot & snapshot, double u, double dt)
+{
+  // 平衡分量：LQR 已限幅到 ±u_max，左右同值（正 = 往前推）
+  std::array<double, 2> tau_ref{{u, u}};
+
+  // 只有 RUN 且命令新鲜时才跟踪速度/偏航；其它状态目标归零，P 项自然退化成阻尼
+  const bool tracking = (status.state == ControlState::kRun) && status.command_fresh;
+  const double v_des = tracking ? std::clamp(
+    snapshot.command.linear_velocity,
+    -config_.max_linear_velocity, config_.max_linear_velocity) : 0.0;
+  const double w_des = tracking ? std::clamp(
+    snapshot.command.yaw_rate, -config_.max_yaw_rate, config_.max_yaw_rate) : 0.0;
+
+  // 线速度误差 P [N·m per m/s]，左右同相；积分项可选（补静摩擦死区）
+  double tau_vel = config_.k_vel_p * (v_des - snapshot.x_dot);
+  if (config_.k_vel_i > 0.0) {
+    if (tracking) {
+      vel_i_ = std::clamp(
+        vel_i_ + config_.k_vel_i * (v_des - snapshot.x_dot) * std::max(0.0, dt),
+        -0.5 * config_.wheel_torque_max, 0.5 * config_.wheel_torque_max);
+    } else {
+      vel_i_ = 0.0;
+    }
+    tau_vel += vel_i_;
+  }
+
+  // 偏航误差 P [N·m per rad/s]，左右反相；yaw_ff 是角速度前馈。
+  // yaw_rate_filt_ 由 computeWheelSpeeds 在本周期已更新（IMU 200 Hz，原始值直接进 P 会抖）
+  double tau_yaw = config_.yaw_ff * w_des + config_.k_yaw_p * (w_des - yaw_rate_filt_);
+  if (config_.k_yaw_i > 0.0) {
+    if (tracking) {
+      yaw_i_ = std::clamp(
+        yaw_i_ + config_.k_yaw_i * (w_des - yaw_rate_filt_) * std::max(0.0, dt),
+        -0.5 * config_.wheel_torque_max, 0.5 * config_.wheel_torque_max);
+    } else {
+      yaw_i_ = 0.0;
+    }
+    tau_yaw += yaw_i_;
+  }
+
+  // 正偏航 = 左转：右轮 +τ_yaw、左轮 −τ_yaw（两轮在世界系里是同一转向方向）
+  tau_ref[0] = std::clamp(
+    u + tau_vel - tau_yaw, -config_.wheel_torque_max, config_.wheel_torque_max);
+  tau_ref[1] = std::clamp(
+    u + tau_vel + tau_yaw, -config_.wheel_torque_max, config_.wheel_torque_max);
+
+  // 一阶低通（沿用 balance_leak_rate）：500 Hz 力矩直通会把腿部/俯仰的 ~10 Hz 谐振激励起来，
+  // 表现为 pitch_rate ±2 rad/s 的极限环。速度通道本来就被这条滤波平滑过，力矩通道也要一致。
+  constexpr double kLeakDefault = 6.0;
+  const double leak_rate =
+    (config_.balance_leak_rate > 0.0) ? config_.balance_leak_rate : kLeakDefault;
+  const double alpha = std::clamp(leak_rate * std::max(0.0, dt), 0.0, 1.0);
+  for (size_t i = 0; i < 2; ++i) {
+    wheel_torque_state_[i] += alpha * (tau_ref[i] - wheel_torque_state_[i]);
+    tau_ref[i] = wheel_torque_state_[i];
+  }
+  return tau_ref;
 }
 
 }  // namespace leg_calc

@@ -31,21 +31,46 @@
 
 #include <Eigen/Eigenvalues>
 
+#include <pthread.h>
+#include <sched.h>
+#include <sys/resource.h>
+
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cmath>
+#include <cstring>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "leg_calc/leg_control_core.hpp"
 #include "leg_calc/leg_control_io.hpp"
 #include "leg_calc/leg_control_types.hpp"
 #include "leg_calc/param_utils.hpp"
+
+namespace
+{
+
+/// 实时热路径（500 Hz 输入/输出）统一 QoS：只保留最新一帧 + best_effort。
+///
+/// 关键点不是“省带宽”，而是**去掉发布端的阻塞**：rmw_fastrtps 默认同步发送，
+/// 可靠传输在订阅端（usb_drive 的单线程 executor 被 USB 同步写卡住时）会让
+/// 队列堆满、publish() 原地等待，控制环随之停摆 ≥100 ms，于是 IMU / 关节 /
+/// 轮反馈三条同时超时 → 故障字 0x23 停机。best_effort 下发布端只投递不等待。
+rclcpp::QoS hotPathQoS()
+{
+  return rclcpp::QoS(rclcpp::KeepLast(1)).best_effort();
+}
+
+}  // namespace
 
 class LegControlNode : public rclcpp::Node
 {
@@ -58,20 +83,44 @@ public:
     const leg_calc::ControllerConfig cfg = buildConfig(nullptr);
     controller_.setConfig(cfg);
     logConfig(cfg);
+    cacheInputConfig(cfg);
+    loadRealtimeParams();
+
+    // 三个互不干扰的回调组（配合 MultiThreadedExecutor）：
+    //   ctrl_group_  ：500 Hz 控制环，独占一组，禁止与自身重入
+    //   input_group_ ：IMU / joint_states / robot_command 回调，彼此串行（写同一份 io_）
+    //   默认组        ：参数服务 + on_set_parameters 回调（rclcpp 固定放这里）
+    // 这样参数校验里的 Eigen 求解、订阅回调里的解析都不会再把控制环饿死；
+    // 换句话说，step() 的“最坏执行时间”从此只反映控制计算本身。
+    ctrl_group_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+    input_group_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+
+    rclcpp::SubscriptionOptions input_opts;
+    input_opts.callback_group = input_group_;
 
     imu_sub_ = create_subscription<sensor_msgs::msg::Imu>(
-      imu_topic_, rclcpp::SensorDataQoS(),
-      [this](const sensor_msgs::msg::Imu::SharedPtr msg) {onImu(*msg);});
+      imu_topic_, hotPathQoS(),
+      [this](const sensor_msgs::msg::Imu::SharedPtr msg) {onImu(*msg);}, input_opts);
     joint_sub_ = create_subscription<sensor_msgs::msg::JointState>(
-      joint_states_topic_, 10,
-      [this](const sensor_msgs::msg::JointState::SharedPtr msg) {onJointStates(*msg);});
+      joint_states_topic_, hotPathQoS(),
+      [this](const sensor_msgs::msg::JointState::SharedPtr msg) {onJointStates(*msg);},
+      input_opts);
     command_sub_ = create_subscription<std_msgs::msg::Float64MultiArray>(
-      command_topic_, 10,
-      [this](const std_msgs::msg::Float64MultiArray::SharedPtr msg) {onCommand(*msg);});
+      command_topic_, hotPathQoS(),
+      [this](const std_msgs::msg::Float64MultiArray::SharedPtr msg) {onCommand(*msg);},
+      input_opts);
 
-    joint_target_pub_ = create_publisher<sensor_msgs::msg::JointState>(joint_target_topic_, 10);
-    wheel_target_pub_ =
-      create_publisher<std_msgs::msg::Float64MultiArray>(wheel_target_topic_, 10);
+    // 500 Hz 热路径输出：depth 1 + best_effort。
+    // 可靠传输在订阅端（usb_drive）偶发卡顿时会让发布端原地阻塞，
+    // 一个 100 ms 的阻塞就足以让 IMU/关节/轮反馈同时超时 → 0x23 停机。
+    // 控制指令只需要“最新值”，丢帧由下一周期补上，因此宁可丢帧也不能阻塞。
+    joint_target_pub_ = create_publisher<sensor_msgs::msg::JointState>(
+      joint_target_topic_, hotPathQoS());
+    wheel_target_pub_ = create_publisher<std_msgs::msg::Float64MultiArray>(
+      wheel_target_topic_, hotPathQoS());
+    wheel_torque_pub_ = create_publisher<std_msgs::msg::Float64MultiArray>(
+      wheel_torque_topic_, hotPathQoS());
+    // 调试话题（~100 Hz）保留 reliable：rviz2 / nav2 / topic echo 默认按可靠订阅
     odom_pub_ = create_publisher<nav_msgs::msg::Odometry>(odom_topic_, 10);
     tf_broadcaster_ = std::make_shared<tf2_ros::TransformBroadcaster>(this);
     state_pub_ = create_publisher<std_msgs::msg::Float64MultiArray>("leg_control/state", 10);
@@ -82,14 +131,17 @@ public:
 
     last_cycle_time_ = now();
     last_timing_pub_ = now();
+    last_debug_pub_ = now();
+    last_state_log_ = now();
     timer_ = create_wall_timer(
       std::chrono::duration<double>(1.0 / std::max(1.0, cfg.control_rate)),
-      [this]() {step();});
+      [this]() {step();}, ctrl_group_);
 
     RCLCPP_INFO(
-      get_logger(), "统一控制节点启动：%.0f Hz，命令 %s，关节 %s → %s，轮子 %s",
-      cfg.control_rate, command_topic_.c_str(), joint_states_topic_.c_str(),
-      joint_target_topic_.c_str(), wheel_target_topic_.c_str());
+      get_logger(), "统一控制节点启动：%.0f Hz（调试输出 %.0f Hz），命令 %s，关节 %s → %s，"
+      "轮速 %s，轮力矩 %s",
+      cfg.control_rate, debug_rate_, command_topic_.c_str(), joint_states_topic_.c_str(),
+      joint_target_topic_.c_str(), wheel_target_topic_.c_str(), wheel_torque_topic_.c_str());
   }
 
 private:
@@ -142,16 +194,36 @@ private:
     declare_parameter("joint_sign", std::vector<double>{1.0, 1.0, 1.0, 1.0});
     declare_parameter("joint_offset", std::vector<double>{0.0, 0.0, 0.0, 0.0});
 
-    declare_parameter("wheel_separation", 0.20);
+    declare_parameter("wheel_separation", 0.305);
     declare_parameter("max_wheel_omega", 20.0);
     declare_parameter("max_balance_omega", 8.0);
     declare_parameter("max_drive_omega", 12.0);
+    declare_parameter("yaw_ff", 0.12);
+    declare_parameter("k_vel_i", 0.0);
+    declare_parameter("k_yaw_i", 0.0);
     declare_parameter("balance_torque_to_omega", 1.0);
     declare_parameter("balance_leak_rate", 6.0);
+
+    // 轮子力矩前馈通道（可选，默认关；固件 PID 双环之上再叠加力矩）
+    declare_parameter("wheel_torque_enable", false);
+    declare_parameter("wheel_torque_max", 0.40);
+    declare_parameter("k_vel_p", 1.0);
+    declare_parameter("k_yaw_p", 0.15);
+    declare_parameter("wheel_brake_damp", 0.02);
 
     declare_parameter("max_linear_velocity", 1.0);
     declare_parameter("max_yaw_rate", 3.0);
     declare_parameter("control_rate", 500.0);
+    // 调试类输出（/odom + TF + /leg_control/state）的发布频率：控制环仍跑 control_rate，
+    // 但这些话题 500 Hz 发布会把单线程 executor 和订阅端（rviz2/ros2 topic echo）拖垮，
+    // 表现为“控制环最坏执行时间 xx ms 超过 2 ms 周期”。0 = 完全不发。
+    declare_parameter("debug_rate", 100.0);
+
+    // 控制线程调度优先级：先试 SCHED_FIFO（rt_priority），没权限（无 CAP_SYS_NICE、
+    // 也没配 rtprio 限额）就退到 nice（rt_nice，0 = 不调）。两者都失败只告警一次。
+    // 目的：2 ms 周期下，普通 CFS 线程会被同机编译/浏览器/IDE 抢 10 ms 量级的时间片。
+    declare_parameter("rt_priority", 60);
+    declare_parameter("rt_nice", -10);
 
     declare_parameter("imu_timeout", 0.10);
     declare_parameter("joint_state_timeout", 0.10);
@@ -179,6 +251,7 @@ private:
     command_topic_ = declare_parameter("command_topic", std::string("robot_command"));
     joint_target_topic_ = declare_parameter("joint_target_topic", std::string("joint_target"));
     wheel_target_topic_ = declare_parameter("wheel_target_topic", std::string("wheel_target"));
+    wheel_torque_topic_ = declare_parameter("wheel_torque_topic", std::string("wheel_torque"));
   }
 
   /// 读取 + 校验一组配置；pending 非空时优先使用参数回调里的新值
@@ -301,14 +374,31 @@ private:
       cfg.joint_offset[i] = joffset[i];
     }
 
-    cfg.wheel_separation = get("wheel_separation").as_double();
     cfg.wheel_radius = cfg.model.wheel_radius;
-    if (!(cfg.wheel_radius > 0.0) || !(cfg.wheel_separation > 0.0)) {
-      throw std::invalid_argument("wheel_radius / wheel_separation 必须为正");
+    if (!(cfg.wheel_radius > 0.0)) {
+      throw std::invalid_argument("wheel_radius 必须为正");
     }
+    cfg.wheel_separation = get("wheel_separation").as_double();
     cfg.max_wheel_omega = get("max_wheel_omega").as_double();
     cfg.max_balance_omega = get("max_balance_omega").as_double();
     cfg.max_drive_omega = get("max_drive_omega").as_double();
+    if (!std::isfinite(cfg.wheel_separation) || !(cfg.wheel_separation > 0.0)) {
+      throw std::invalid_argument("wheel_separation 必须有限且为正");
+    }
+    if (!std::isfinite(cfg.max_drive_omega) || !(cfg.max_drive_omega > 0.0)) {
+      throw std::invalid_argument("max_drive_omega 必须有限且为正");
+    }
+    cfg.yaw_ff = get("yaw_ff").as_double();
+    if (!std::isfinite(cfg.yaw_ff) || cfg.yaw_ff < 0.0) {
+      throw std::invalid_argument("yaw_ff 必须有限且非负");
+    }
+    cfg.k_vel_i = get("k_vel_i").as_double();
+    cfg.k_yaw_i = get("k_yaw_i").as_double();
+    if (!std::isfinite(cfg.k_vel_i) || cfg.k_vel_i < 0.0 ||
+      !std::isfinite(cfg.k_yaw_i) || cfg.k_yaw_i < 0.0)
+    {
+      throw std::invalid_argument("k_vel_i / k_yaw_i 必须有限且非负");
+    }
     cfg.balance_torque_to_omega = get("balance_torque_to_omega").as_double();
     cfg.balance_leak_rate = get("balance_leak_rate").as_double();
     if (!std::isfinite(cfg.balance_torque_to_omega) ||
@@ -318,11 +408,31 @@ private:
       throw std::invalid_argument("轮速映射系数和轮速限幅必须有限且为正");
     }
 
+    // 轮子力矩前馈通道（可选，默认关）
+    cfg.wheel_torque_enable = get("wheel_torque_enable").as_bool();
+    cfg.wheel_torque_max = get("wheel_torque_max").as_double();
+    cfg.k_vel_p = get("k_vel_p").as_double();
+    cfg.k_yaw_p = get("k_yaw_p").as_double();
+    cfg.wheel_brake_damp = get("wheel_brake_damp").as_double();
+    if (!(cfg.wheel_torque_max > 0.0) || !std::isfinite(cfg.wheel_torque_max)) {
+      throw std::invalid_argument("wheel_torque_max 必须有限且为正");
+    }
+    if (!std::isfinite(cfg.k_vel_p) || cfg.k_vel_p < 0.0 ||
+      !std::isfinite(cfg.k_yaw_p) || cfg.k_yaw_p < 0.0 ||
+      !std::isfinite(cfg.wheel_brake_damp) || cfg.wheel_brake_damp < 0.0)
+    {
+      throw std::invalid_argument("k_vel_p / k_yaw_p / wheel_brake_damp 必须有限且非负");
+    }
+
     cfg.max_linear_velocity = get("max_linear_velocity").as_double();
     cfg.max_yaw_rate = get("max_yaw_rate").as_double();
     cfg.control_rate = get("control_rate").as_double();
     if (!(cfg.control_rate >= 50.0 && cfg.control_rate <= 2000.0)) {
       throw std::invalid_argument("control_rate 必须在 [50, 2000] Hz");
+    }
+    debug_rate_ = get("debug_rate").as_double();
+    if (!std::isfinite(debug_rate_) || debug_rate_ < 0.0 || debug_rate_ > cfg.control_rate) {
+      throw std::invalid_argument("debug_rate 必须在 [0, control_rate] 内（0 = 关掉调试输出）");
     }
 
     cfg.safety.imu_timeout = get("imu_timeout").as_double();
@@ -380,6 +490,21 @@ private:
       cfg.u_max, cfg.com_height_min, cfg.com_height_max, cfg.joint_torque_max,
       cfg.balance_torque_to_omega, cfg.safety.imu_timeout, cfg.safety.joint_timeout,
       cfg.safety.command_timeout, cfg.safety.command_fault_timeout);
+    RCLCPP_INFO(
+      get_logger(),
+      "轮子主通道：/wheel_target（速度，固件位置+速度双环），轮距 %.3f m，"
+      "平衡折算 %.2f rad/s/N·m，差速限幅 %.1f / 总限幅 %.1f rad/s",
+      cfg.wheel_separation, cfg.balance_torque_to_omega, cfg.max_drive_omega,
+      cfg.max_wheel_omega);
+    if (cfg.wheel_torque_enable) {
+      RCLCPP_INFO(
+        get_logger(),
+        "轮子力矩前馈：开，上限 %.2f N·m，k_vel_p=%.2f，k_yaw_p=%.2f，yaw_ff=%.2f，"
+        "制动阻尼 %.3f",
+        cfg.wheel_torque_max, cfg.k_vel_p, cfg.k_yaw_p, cfg.yaw_ff, cfg.wheel_brake_damp);
+    } else {
+      RCLCPP_INFO(get_logger(), "轮子力矩前馈：关（/wheel_torque 恒为 0，执行全在固件 PID 双环）");
+    }
   }
 
   rcl_interfaces::msg::SetParametersResult onParameterChange(
@@ -399,17 +524,31 @@ private:
       "com_height_default", "com_height_min", "com_height_max", "com_height_rate",
       "joint_torque_max", "joint_torque_sign", "joint_sign", "joint_offset",
       "wheel_separation", "max_wheel_omega", "max_balance_omega", "max_drive_omega",
-      "balance_torque_to_omega", "balance_leak_rate", "max_linear_velocity", "max_yaw_rate",
+      "yaw_ff", "k_vel_i", "k_yaw_i",
+      "balance_torque_to_omega", "balance_leak_rate",
+      "wheel_torque_enable", "wheel_torque_max", "k_vel_p", "k_yaw_p", "wheel_brake_damp",
+      "max_linear_velocity", "max_yaw_rate",
       "imu_timeout", "joint_state_timeout", "wheel_state_timeout",
       "command_timeout", "command_fault_timeout",
       "max_pitch", "max_pitch_rate", "startup_cycles", "leg_joint_names", "wheel_joint_names"};
 
     bool touched = false;
+    bool rt_touched = false;
     for (const auto & param : params) {
+      if (param.get_name() == "rt_priority" || param.get_name() == "rt_nice") {
+        rt_touched = true;
+        continue;
+      }
       if (std::find(kTunable.begin(), kTunable.end(), param.get_name()) != kTunable.end()) {
         touched = true;
-        break;
       }
+    }
+    // 调度优先级不属于 ControllerConfig：改完只置脏标志，由控制环重新应用到
+    // “当前真正执行 step() 的那个线程”（MultiThreadedExecutor 可能换线程）
+    if (rt_touched) {
+      rt_priority_ = static_cast<int>(get_parameter("rt_priority").as_int());
+      rt_nice_ = static_cast<int>(get_parameter("rt_nice").as_int());
+      rt_dirty_ = true;
     }
     if (!touched) {
       return result;
@@ -422,7 +561,9 @@ private:
 
     try {
       // 只校验 + 缓存，真正的切换放到下一个控制周期边界
-      pending_config_ = buildConfig(&pending);
+      const leg_calc::ControllerConfig next = buildConfig(&pending);
+      std::lock_guard<std::mutex> lock(pending_mutex_);
+      pending_config_ = next;
     } catch (const std::exception & e) {
       result.successful = false;
       result.reason = e.what();
@@ -430,19 +571,111 @@ private:
     return result;
   }
 
+  /// 把订阅回调需要的那几个配置项拷一份出来：回调线程不再直接读 controller_，
+  /// 避免 setConfig() 与 config() 跨线程竞争
+  void cacheInputConfig(const leg_calc::ControllerConfig & cfg)
+  {
+    std::lock_guard<std::mutex> lock(io_mutex_);
+    input_axis_index_ = cfg.axis_index;
+    input_theta_offset_ = cfg.theta_offset;
+    input_leg_joint_names_ = cfg.leg_joint_names;
+    input_wheel_joint_names_ = cfg.wheel_joint_names;
+  }
+
+  /// 参数里的 rt_priority / rt_nice 读进原子量（构造与参数回调都会走）
+  void loadRealtimeParams()
+  {
+    rt_priority_ = static_cast<int>(get_parameter("rt_priority").as_int());
+    rt_nice_ = static_cast<int>(get_parameter("rt_nice").as_int());
+    rt_dirty_ = true;
+  }
+
+  /// 保证“正在执行 step() 的这个线程”拿到了实时优先级。
+  ///
+  /// MultiThreadedExecutor 不保证总用同一个线程跑定时器回调（实测在 3 个线程间
+  /// 来回跳），所以按线程 id 记账：每个线程只尝试设置一次，设置过的直接跳过。
+  /// 这样既不会每周期重复调用 pthread_setschedparam，也不会把日志刷爆。
+  void ensureRealtime()
+  {
+    if (rt_dirty_.exchange(false)) {
+      rt_threads_.clear();
+      rt_warned_ = false;
+    }
+    const std::thread::id tid = std::this_thread::get_id();
+    if (std::find(rt_threads_.begin(), rt_threads_.end(), tid) != rt_threads_.end()) {
+      return;
+    }
+    // executor 线程数有限，这里只是防御性上限（不会真的超过线程池大小）
+    if (rt_threads_.size() >= 8) {
+      rt_threads_.clear();
+      rt_warned_ = false;
+    }
+    rt_threads_.push_back(tid);
+    applyRealtimePolicy();
+  }
+
+  void applyRealtimePolicy()
+  {
+    const int priority = rt_priority_.load();
+    const int nice = rt_nice_.load();
+    if (priority <= 0 && nice == 0) {
+      return;
+    }
+
+    // ① SCHED_FIFO（需要 CAP_SYS_NICE，或 /etc/security/limits.conf 里给 rtprio）
+    //   注意：pthread_* 直接返回错误码，不写 errno
+    int fifo_err = 0;
+    if (priority > 0) {
+      sched_param sp{};
+      sp.sched_priority = priority;
+      fifo_err = pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp);
+      if (fifo_err == 0) {
+        RCLCPP_INFO(get_logger(), "控制线程已切到 SCHED_FIFO 优先级 %d", priority);
+        return;
+      }
+    }
+
+    // ② 退化到 nice（Linux 上 nice 是 per-thread 的，只影响这个线程）
+    int nice_err = 0;
+    if (nice != 0) {
+      if (setpriority(PRIO_PROCESS, 0, nice) == 0) {
+        RCLCPP_INFO(
+          get_logger(), "控制线程 nice=%d 生效（SCHED_FIFO 不可用：%s）",
+          nice, fifo_err != 0 ? std::strerror(fifo_err) : "未启用");
+        return;
+      }
+      nice_err = errno;
+    }
+
+    // 两条都失败：只告警一次，别把 500 Hz 的日志刷爆
+    if (!rt_warned_) {
+      rt_warned_ = true;
+      RCLCPP_WARN(
+        get_logger(),
+        "无法提升控制线程优先级（SCHED_FIFO %d: %s；nice %d: %s）：2 ms 周期下可能出现"
+        "十几毫秒的调度抖动。修法：sudo setcap cap_sys_nice+ep install/leg_calc/lib/"
+        "leg_calc/leg_control_node（或 limits.conf 加 \"<user> - rtprio 80\"），"
+        "并把 CPU governor 设为 performance",
+        priority, fifo_err != 0 ? std::strerror(fifo_err) : "未启用",
+        nice, nice_err != 0 ? std::strerror(nice_err) : "未启用");
+    }
+  }
+
   // ==================== 输入回调 ====================
+  // 这些回调跑在 input_group_ 的线程上，与 step() 并发；
+  // 它们只碰 io_ 和“配置快照副本”，不读 controller_，因此 setConfig 不必加锁。
   void onImu(const sensor_msgs::msg::Imu & msg)
   {
-    io_.onImu(
-      msg, controller_.config().axis_index, controller_.config().theta_offset,
-      now().seconds());
+    const double stamp_s = now().seconds();
+    std::lock_guard<std::mutex> lock(io_mutex_);
+    io_.onImu(msg, input_axis_index_, input_theta_offset_, stamp_s);
   }
 
   void onJointStates(const sensor_msgs::msg::JointState & msg)
   {
-    io_.onJointStates(
-      msg, controller_.config().leg_joint_names, controller_.config().wheel_joint_names,
-      now().seconds());
+    const double stamp_s = now().seconds();
+    std::lock_guard<std::mutex> lock(io_mutex_);
+    io_.onJointStates(msg, input_leg_joint_names_, input_wheel_joint_names_, stamp_s);
   }
 
   void onCommand(const std_msgs::msg::Float64MultiArray & msg)
@@ -453,29 +686,42 @@ private:
         command_topic_.c_str(), static_cast<size_t>(leg_calc::kCmdCount));
       return;
     }
-    io_.onCommand(msg, now().seconds());
+    const double stamp_s = now().seconds();
+    std::lock_guard<std::mutex> lock(io_mutex_);
+    io_.onCommand(msg, stamp_s);
   }
 
   // ==================== 500 Hz 主循环 ====================
   void step()
   {
     const auto cycle_start = std::chrono::steady_clock::now();
+    ensureRealtime();
     const rclcpp::Time stamp = now();
     const double stamp_s = stamp.seconds();
 
-    // 1) 参数在周期边界统一切换
-    if (pending_config_) {
-      controller_.setConfig(*pending_config_);
-      logConfig(*pending_config_);
-      pending_config_.reset();
+    // 1) 参数在周期边界统一切换（与参数服务线程共享 pending_config_）
+    std::optional<leg_calc::ControllerConfig> pending;
+    {
+      std::lock_guard<std::mutex> lock(pending_mutex_);
+      pending.swap(pending_config_);
+    }
+    if (pending) {
+      controller_.setConfig(*pending);
+      cacheInputConfig(*pending);
+      logConfig(*pending);
     }
 
     const double dt = std::clamp((stamp - last_cycle_time_).seconds(), 1e-4, 0.05);
     last_cycle_time_ = stamp;
 
-    // 2) 快照 → 控制计算
-    const leg_calc::StateSnapshot snapshot =
-      io_.build(stamp_s, controller_.config().wheel_radius);
+    // 2) 快照 → 控制计算（io_ 只在锁内碰，临界区是几次赋值）
+    leg_calc::StateSnapshot snapshot;
+    double travel = 0.0;
+    {
+      std::lock_guard<std::mutex> lock(io_mutex_);
+      travel = io_.wheelTravel(controller_.config().wheel_radius);
+      snapshot = io_.build(stamp_s, controller_.config().wheel_radius);
+    }
     const leg_calc::ControlOutput output = controller_.step(snapshot, dt);
 
     // 3) 输出
@@ -483,8 +729,20 @@ private:
       leg_calc::makeJointTarget(
         controller_.config().leg_joint_names, snapshot, output, stamp));
     wheel_target_pub_->publish(leg_calc::makeWheelTarget(output));
-    publishOdom(snapshot, stamp);
-    state_pub_->publish(leg_calc::makeStateDebug(snapshot, output));
+    // 力矩前馈单独走一路：默认关闭（wheel_torque_enable=false 时恒为 0），
+    // 打开后固件把它加到速度环输出上，主通道仍是上面的 /wheel_target
+    const leg_calc::ControllerConfig & cfg_now = controller_.config();
+    const double force_to_torque =
+      (cfg_now.model.input_mode == leg_calc::InputMode::kForce) ?
+      cfg_now.model.wheel_radius : 1.0;
+    wheel_torque_pub_->publish(leg_calc::makeWheelTorque(output, force_to_torque));
+
+    // 调试类输出降频：里程计积分仍每周期做（丢周期会丢弧长），只把话题/TF 按 debug_rate 发
+    const bool debug_tick = debugDue(stamp);
+    publishOdom(snapshot, travel, stamp, debug_tick);
+    if (debug_tick) {
+      state_pub_->publish(leg_calc::makeStateDebug(snapshot, output));
+    }
 
     reportStateChange(output);
 
@@ -504,11 +762,25 @@ private:
     publishTiming(stamp);
   }
 
-  /// 2D 轮式里程计：前进弧长（轮角差分）× 朝向（IMU yaw）→ odom 位姿 + odom→base_link TF
-  void publishOdom(const leg_calc::StateSnapshot & snapshot, const rclcpp::Time & stamp)
+  /// 调试输出是否该发：按 debug_rate 降频（0 = 不输出）
+  bool debugDue(const rclcpp::Time & stamp)
   {
-    const auto & cfg = controller_.config();
+    if (debug_rate_ <= 0.0) {
+      return false;
+    }
+    if ((stamp - last_debug_pub_).seconds() < 1.0 / debug_rate_) {
+      return false;
+    }
+    last_debug_pub_ = stamp;
+    return true;
+  }
 
+  /// 2D 轮式里程计：前进弧长（轮角差分）× 朝向（IMU yaw）→ odom 位姿 + odom→base_link TF
+  /// travel 由 step() 在 io_mutex_ 内取出后传进来（io_ 不再在锁外被读）
+  void publishOdom(
+    const leg_calc::StateSnapshot & snapshot, double travel, const rclcpp::Time & stamp,
+    bool publish)
+  {
     // 朝向取 IMU yaw，并减掉启动时的初始朝向（使起步朝 +x）
     if (snapshot.imu_ok && !yaw_offset_set_) {
       yaw_offset_ = snapshot.yaw;
@@ -517,7 +789,6 @@ private:
     const double heading = snapshot.yaw - yaw_offset_;
 
     // 前进弧长用绝对轮角差分（比 v·dt 抗速度抖动，不累积速度误差）
-    const double travel = io_.wheelTravel(cfg.wheel_radius);
     double ds = 0.0;
     if (last_wheel_travel_valid_) {
       ds = travel - last_wheel_travel_;
@@ -527,6 +798,10 @@ private:
 
     odom_x_ += ds * std::cos(heading);
     odom_y_ += ds * std::sin(heading);
+
+    if (!publish) {
+      return;
+    }
 
     nav_msgs::msg::Odometry odom;
     odom.header.stamp = stamp;
@@ -592,14 +867,19 @@ private:
     {
       return;
     }
-    if (output.state == leg_calc::ControlState::kFault) {
-      RCLCPP_ERROR(
-        get_logger(), "状态 %s，故障 0x%02X",
-        leg_calc::toString(output.state), output.faults);
-    } else {
-      RCLCPP_INFO(
-        get_logger(), "状态 %s，故障 0x%02X",
-        leg_calc::toString(output.state), output.faults);
+    // 抖动抑制：故障位每周期都可能翻，日志一多（尤其终端是 IDE pipe）会反压控制环
+    const rclcpp::Time log_stamp = now();
+    if ((log_stamp - last_state_log_).seconds() >= 0.2) {
+      last_state_log_ = log_stamp;
+      if (output.state == leg_calc::ControlState::kFault) {
+        RCLCPP_ERROR(
+          get_logger(), "状态 %s，故障 0x%02X",
+          leg_calc::toString(output.state), output.faults);
+      } else {
+        RCLCPP_INFO(
+          get_logger(), "状态 %s，故障 0x%02X",
+          leg_calc::toString(output.state), output.faults);
+      }
     }
     last_reported_state_ = output.state;
     last_reported_faults_ = output.faults;
@@ -608,8 +888,26 @@ private:
 
   // ==================== 成员 ====================
   leg_calc::LegController controller_{};
+  /// io_ 与“订阅回调用的配置副本”都受这把锁保护：
+  /// 输入回调跑在 input_group_ 线程，step() 跑在 ctrl_group_ 线程
   leg_calc::SnapshotIO io_{};
+  std::mutex io_mutex_;
+  int input_axis_index_{0};
+  double input_theta_offset_{0.0};
+  std::vector<std::string> input_leg_joint_names_;
+  std::vector<std::string> input_wheel_joint_names_;
+
+  /// 参数回调（默认回调组线程）→ 控制环（ctrl_group_ 线程）
   std::optional<leg_calc::ControllerConfig> pending_config_{};
+  std::mutex pending_mutex_;
+
+  // 控制线程实时性（rt_threads_ / rt_warned_ 只由 step() 访问：
+  // 定时器独占 ctrl_group_，不会重入）
+  std::atomic<int> rt_priority_{0};
+  std::atomic<int> rt_nice_{0};
+  std::atomic_bool rt_dirty_{true};
+  std::vector<std::thread::id> rt_threads_;
+  bool rt_warned_{false};
 
   std::string imu_topic_{"imu/data"};
   std::string odom_topic_{"odom"};
@@ -619,9 +917,15 @@ private:
   std::string command_topic_{"robot_command"};
   std::string joint_target_topic_{"joint_target"};
   std::string wheel_target_topic_{"wheel_target"};
+  std::string wheel_torque_topic_{"wheel_torque"};
 
   rclcpp::Time last_cycle_time_{0, 0, RCL_ROS_TIME};
   rclcpp::Time last_timing_pub_{0, 0, RCL_ROS_TIME};
+  /// 调试输出降频：最后一次发布 /odom、TF、/leg_control/state 的时间
+  rclcpp::Time last_debug_pub_{0, 0, RCL_ROS_TIME};
+  double debug_rate_{100.0};
+  /// 状态变化日志的最小间隔，避免故障抖动时把终端刷爆（日志阻塞也会反压控制环）
+  rclcpp::Time last_state_log_{0, 0, RCL_ROS_TIME};
   int timing_count_{0};
   double period_sum_ms_{0.0};
   double period_max_ms_{0.0};
@@ -646,18 +950,26 @@ private:
   rclcpp::Subscription<std_msgs::msg::Float64MultiArray>::SharedPtr command_sub_;
   rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr joint_target_pub_;
   rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr wheel_target_pub_;
+  rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr wheel_torque_pub_;
   rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr odom_pub_;
   std::shared_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
   rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr state_pub_;
   rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr timing_pub_;
   rclcpp::TimerBase::SharedPtr timer_;
   OnSetParametersCallbackHandle::SharedPtr param_cb_;
+  rclcpp::CallbackGroup::SharedPtr ctrl_group_;
+  rclcpp::CallbackGroup::SharedPtr input_group_;
 };
 
 int main(int argc, char ** argv)
 {
   rclcpp::init(argc, argv);
-  rclcpp::spin(std::make_shared<LegControlNode>());
+  // 多线程 executor：控制环（ctrl_group_）、输入订阅（input_group_）、参数服务（默认组）
+  // 三者互不相同的 callback group，可以并行推进 —— 单个回调再慢也不会把控制环饿死。
+  rclcpp::executors::MultiThreadedExecutor executor(rclcpp::ExecutorOptions(), 3);
+  auto node = std::make_shared<LegControlNode>();
+  executor.add_node(node);
+  executor.spin();
   rclcpp::shutdown();
   return 0;
 }

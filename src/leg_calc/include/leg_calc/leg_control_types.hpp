@@ -61,13 +61,36 @@ struct ControllerConfig
   std::array<double, 4> joint_sign{{1.0, 1.0, 1.0, 1.0}};
   std::array<double, 4> joint_offset{{0.0, 0.0, 0.0, 0.0}};
 
-  double wheel_separation{0.20};
   double wheel_radius{0.065};
-  double max_wheel_omega{20.0};
-  double max_balance_omega{8.0};
-  double max_drive_omega{12.0};
-  double balance_torque_to_omega{1.0};  ///< [rad/s per N·m]，按实机标定
+  /// 轮距 L [m]：差速分配用 ω_L/R = (v ∓ 0.5·L·ω) / r
+  double wheel_separation{0.305};
+  double max_wheel_omega{20.0};         ///< 单轮角速度总限幅 [rad/s]（平衡 + 行驶）
+  double max_balance_omega{8.0};        ///< 平衡分量限幅 [rad/s]
+  double max_drive_omega{12.0};         ///< 行驶 / 转向分量限幅 [rad/s]
+  /// LQR 力矩型输出 → 轮速目标的折算系数 [rad/s per N·m]：
+  /// 固件轮子是"位置外环 + 速度内环"的双环 PID，只能接速度目标，故在此折算
+  double balance_torque_to_omega{1.0};
   double balance_leak_rate{6.0};        ///< 平衡轮速指令一阶低通系数 [1/s]，越大跟随越快
+
+  // --------- 轮子力矩前馈通道（可选，默认关闭） ---------
+  // 固件已恢复 PID 双环：主通道是 /wheel_target（速度），力矩只是叠加在速度环输出上的前馈。
+  /// 总开关：false = 力矩前馈恒为 0（默认）；true = 额外下发 LQR + 速度/偏航误差 P
+  bool wheel_torque_enable{false};
+  /// 单轮力矩前馈限幅 [N·m]（≈轮地摩擦上限 μ·N·r）
+  double wheel_torque_max{0.40};
+  /// 偏航角速度前馈 [N·m per rad/s]：力矩前馈模式下给左右反相的差动量
+  double yaw_ff{0.12};
+  /// 线速度误差 P 增益 [N·m per (m/s)]：τ_v = k_vel_p·(v_des − ẋ)，左右同相
+  double k_vel_p{1.0};
+  /// 线速度积分增益 [N·m / (m/s) / s]（补静摩擦死区与稳态跟踪差）
+  double k_vel_i{0.0};
+  /// 偏航角速度误差 P 增益 [N·m per (rad/s)]：τ_yaw = k_yaw_p·(ω_des − ω_measured)
+  double k_yaw_p{0.15};
+  /// 偏航角速度积分增益 [N·m / (rad/s) / s]
+  double k_yaw_i{0.0};
+  /// 非平衡态（未使能 / FAULT）的阻尼制动 [N·m per (rad/s)]，仅力矩前馈模式使用；
+  /// 速度通道下非平衡态直接给 ω_ref = 0，由固件位置环锁住轮子
+  double wheel_brake_damp{0.02};
 
   SafetyLimits safety;
   double control_rate{500.0};
@@ -111,7 +134,15 @@ struct ControlOutput
   uint32_t faults{kFaultNone};
 
   std::array<double, 4> joint_torque{{0.0, 0.0, 0.0, 0.0}};
+  /// IK 目标角（关节坐标系，顺序同 leg_joint_names）[rad]；IK 失败时保持 0
+  std::array<double, 4> joint_position_target{{0.0, 0.0, 0.0, 0.0}};
+  /// 目标角速度 [rad/s]（准静态站姿，恒 0；只有高度斜坡时才该有值）
+  std::array<double, 4> joint_velocity_target{{0.0, 0.0, 0.0, 0.0}};
+  bool joint_target_valid{false};  ///< IK 是否成功
+
   std::array<double, 2> wheel_omega_ref{{0.0, 0.0}};
+  /// 轮轴力矩指令 [N·m]（左, 右）= 平衡 + 速度误差 P ± 偏航误差 P，已限幅到 wheel_torque_max
+  std::array<double, 2> wheel_torque_ref{{0.0, 0.0}};
 
   double u{0.0};            ///< Pitch LQR 输出的轮轴平衡力矩 [N·m]
   double com_height{0.30};  ///< 本周期实测质心高度（五杆 FK 反算）[m]

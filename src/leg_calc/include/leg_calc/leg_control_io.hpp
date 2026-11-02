@@ -48,7 +48,6 @@ public:
   /// 轮端里程计：x = r·(φL+φR)/2
   double wheelTravel(double wheel_radius) const;
   double wheelSpeed(double wheel_radius) const;
-  double wheelYawRate(double wheel_radius, double wheel_separation) const;
 
   bool commandSeen() const {return command_seen_;}
 
@@ -80,6 +79,18 @@ sensor_msgs::msg::JointState makeJointTarget(
   const ControlOutput & output, const rclcpp::Time & stamp);
 
 std_msgs::msg::Float64MultiArray makeWheelTarget(const ControlOutput & output);
+
+/**
+ * @brief 轮轴力矩 → /wheel_torque（[τ_L, τ_R]，N*m），交给下位机做电流直通
+ *
+ * 内容 = 平衡 u + 速度误差 P（左右同相）± 偏航误差 P（左右反相，即力矩差速）；
+ * 非平衡态时是阻尼制动项。
+ *
+ * @param output          控制输出（wheel_torque_ref 已在核心里限幅）
+ * @param force_to_torque input_mode=kForce 时传轮半径 r（F→τ），kWheelTorque 时传 1.0
+ */
+std_msgs::msg::Float64MultiArray makeWheelTorque(
+  const ControlOutput & output, double force_to_torque);
 
 std_msgs::msg::Float64MultiArray makeStateDebug(
   const StateSnapshot & snapshot, const ControlOutput & output);

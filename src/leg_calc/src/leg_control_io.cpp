@@ -44,6 +44,24 @@ void SnapshotIO::onJointStates(
   const std::vector<std::string> & leg_joint_names,
   const std::vector<std::string> & wheel_joint_names, double stamp_s)
 {
+  // 同一个 /joint_states 上可能还有别的机器人（多栈共用一个 ROS domain 时很常见）。
+  // 完全不含本机关节名的消息要整条忽略：不能让它把 joint_ok_/wheel_ok_ 打 false，
+  // 否则每来一条别人的消息就掉一次故障位（实测表现为 0x22 ↔ 0x00 每秒抖、
+  // 自检周期永远攒不满，状态停在 INIT）。
+  const bool mentions_leg = std::any_of(
+    leg_joint_names.begin(), leg_joint_names.end(),
+    [&msg](const std::string & name) {
+      return std::find(msg.name.begin(), msg.name.end(), name) != msg.name.end();
+    });
+  const bool mentions_wheel = std::any_of(
+    wheel_joint_names.begin(), wheel_joint_names.end(),
+    [&msg](const std::string & name) {
+      return std::find(msg.name.begin(), msg.name.end(), name) != msg.name.end();
+    });
+  if (!mentions_leg && !mentions_wheel) {
+    return;
+  }
+
   bool all_leg = true;
   for (size_t i = 0; i < leg_joint_names.size() && i < 4; ++i) {
     const auto it = std::find(msg.name.begin(), msg.name.end(), leg_joint_names[i]);
@@ -84,15 +102,20 @@ void SnapshotIO::onJointStates(
     wheel_angle_[i] = angle;
     wheel_omega_[i] = omega;
   }
-  wheel_ok_ = all_wheel;
-  if (all_wheel) {
-    last_wheel_s_ = stamp_s;
+  // 只用“提到本机关节”的那部分结果更新有效位，另一部分交给超时判定
+  if (mentions_wheel) {
+    wheel_ok_ = all_wheel;
+    if (all_wheel) {
+      last_wheel_s_ = stamp_s;
+    }
   }
 
-  if (all_leg) {
-    last_joint_s_ = stamp_s;
+  if (mentions_leg) {
+    joint_ok_ = all_leg;
+    if (all_leg) {
+      last_joint_s_ = stamp_s;
+    }
   }
-  joint_ok_ = all_leg;
 }
 
 void SnapshotIO::onCommand(const std_msgs::msg::Float64MultiArray & msg, double stamp_s)
@@ -100,8 +123,9 @@ void SnapshotIO::onCommand(const std_msgs::msg::Float64MultiArray & msg, double 
   if (msg.data.size() < static_cast<size_t>(kCmdCount)) {
     return;
   }
-  if (!std::all_of(msg.data.begin(), msg.data.begin() + kCmdCount,
-    [](double value) {return std::isfinite(value);}))
+  if (!std::all_of(
+      msg.data.begin(), msg.data.begin() + kCmdCount,
+      [](double value) {return std::isfinite(value);}))
   {
     return;
   }
@@ -148,14 +172,6 @@ double SnapshotIO::wheelSpeed(double wheel_radius) const
   return 0.5 * (wheel_omega_[0] + wheel_omega_[1]) * wheel_radius;
 }
 
-double SnapshotIO::wheelYawRate(double wheel_radius, double wheel_separation) const
-{
-  if (wheel_separation < 1e-9) {
-    return 0.0;
-  }
-  return (wheel_omega_[1] - wheel_omega_[0]) * wheel_radius / wheel_separation;
-}
-
 sensor_msgs::msg::JointState makeJointTarget(
   const std::vector<std::string> & leg_joint_names, const StateSnapshot & snapshot,
   const ControlOutput & output, const rclcpp::Time & stamp)
@@ -163,12 +179,25 @@ sensor_msgs::msg::JointState makeJointTarget(
   sensor_msgs::msg::JointState msg;
   msg.header.stamp = stamp;
   msg.name = leg_joint_names;
-  msg.position.assign(snapshot.joint_position.begin(), snapshot.joint_position.end());
-  msg.velocity.assign(snapshot.joint_velocity.begin(), snapshot.joint_velocity.end());
+  // position/velocity 是“目标”（下位机运控帧的伺服参考），不是回传值：
+  // 目标角由足端目标 IK 得到；usb_drive 的 joint_kp/joint_kd = 0 时这两个字段被忽略，
+  // 行为与“纯力矩”完全一致；把 kp/kd 调大就自动变成 MIT 模式（PD + 力矩前馈）。
+  if (output.joint_target_valid) {
+    msg.position.assign(
+      output.joint_position_target.begin(), output.joint_position_target.end());
+    msg.velocity.assign(
+      output.joint_velocity_target.begin(), output.joint_velocity_target.end());
+  } else {
+    // IK 失败：退回实测值（配合 kp=0 无影响）
+    msg.position.assign(snapshot.joint_position.begin(), snapshot.joint_position.end());
+    msg.velocity.assign(snapshot.joint_velocity.begin(), snapshot.joint_velocity.end());
+  }
   msg.effort.assign(output.joint_torque.begin(), output.joint_torque.end());
   if (!output.joints_enabled) {
-    // 失力：力矩清零，位置/速度回传实测值（usb_drive 侧 kp/kd=0 即“自由状态”）
+    // 失力：力矩清零，位置/速度回退成实测值（usb_drive 侧 kp/kd=0 即“自由状态”）
     std::fill(msg.effort.begin(), msg.effort.end(), 0.0);
+    msg.position.assign(snapshot.joint_position.begin(), snapshot.joint_position.end());
+    msg.velocity.assign(snapshot.joint_velocity.begin(), snapshot.joint_velocity.end());
   }
   return msg;
 }
@@ -177,6 +206,20 @@ std_msgs::msg::Float64MultiArray makeWheelTarget(const ControlOutput & output)
 {
   std_msgs::msg::Float64MultiArray msg;
   msg.data = {output.wheel_omega_ref[0], output.wheel_omega_ref[1]};
+  return msg;
+}
+
+std_msgs::msg::Float64MultiArray makeWheelTorque(
+  const ControlOutput & output, double force_to_torque)
+{
+  // 力矩通道：[τ_左, τ_右] = 平衡 u + 速度误差 P ± 偏航误差 P，控制核心里已限幅。
+  // 左右不再同值：转向就是靠这两轮的力矩差（下位机已不做闭环，/wheel_target 不再生效）。
+  // 非平衡态（未使能 / FAULT）时 wheel_torque_ref 是阻尼制动项，丢掉等于轮子自由滚，
+  // 所以这里不再按 balance_enabled 清零。
+  std_msgs::msg::Float64MultiArray msg;
+  msg.data = {
+    output.wheel_torque_ref[0] * force_to_torque,
+    output.wheel_torque_ref[1] * force_to_torque};
   return msg;
 }
 

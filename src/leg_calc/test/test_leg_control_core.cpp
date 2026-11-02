@@ -120,7 +120,6 @@ TEST(LegControlCore, WheelAllocationRespectsLimits)
 {
   auto cfg = makeConfig();
   cfg.max_wheel_omega = 5.0;
-  cfg.max_drive_omega = 4.0;
   leg_calc::LegController controller(cfg);
 
   // 大速度 + 大转向：只允许在限幅内输出
@@ -135,7 +134,63 @@ TEST(LegControlCore, StraightDriveMakesBothWheelsSameDirection)
   leg_calc::LegController controller(makeConfig());
   const auto out = runUntil(controller, makeSnapshot(true, 0.3, 0.0), leg_calc::ControlState::kRun);
 
+  // 速度通道只载"平衡 + 阻尼补偿"（直线），左右同值同向
   EXPECT_GT(out.wheel_omega_ref[0] * out.wheel_omega_ref[1], 0.0);
+  EXPECT_DOUBLE_EQ(out.wheel_omega_ref[0], out.wheel_omega_ref[1]);
+}
+
+TEST(LegControlCore, WheelTorqueIsBalancePlusVelocityP)
+{
+  auto cfg = makeConfig();
+  cfg.wheel_torque_enable = true;   // 力矩前馈是可选项，默认关
+  cfg.k_vel_p = 1.0;
+  leg_calc::LegController controller(cfg);
+  const auto out = runUntil(controller, makeSnapshot(true, 0.3, 0.0), leg_calc::ControlState::kRun);
+
+  // 挂空转（x_dot=0）给 0.3 m/s：τ = u + k_vel_p·v_des，左右同相、被 wheel_torque_max 限幅
+  EXPECT_GT(out.wheel_torque_ref[0], 0.0);
+  EXPECT_DOUBLE_EQ(out.wheel_torque_ref[0], out.wheel_torque_ref[1]);
+  for (double tau : out.wheel_torque_ref) {
+    EXPECT_LE(std::abs(tau), cfg.wheel_torque_max + 1e-12);
+  }
+}
+
+TEST(LegControlCore, WheelTorqueDisabledByDefault)
+{
+  // 固件已恢复 PID 双环：主通道是 /wheel_target，力矩前馈默认必须恒为 0
+  leg_calc::LegController controller(makeConfig());
+  const auto out = runUntil(controller, makeSnapshot(true, 0.3, 0.5), leg_calc::ControlState::kRun);
+
+  for (double tau : out.wheel_torque_ref) {
+    EXPECT_DOUBLE_EQ(tau, 0.0);
+  }
+}
+
+TEST(LegControlCore, LeftTurnMakesRightWheelMoreTorque)
+{
+  auto cfg = makeConfig();
+  cfg.wheel_torque_enable = true;
+  cfg.yaw_ff = 0.12;
+  cfg.k_yaw_p = 0.15;
+  leg_calc::LegController controller(cfg);
+  const auto out = runUntil(controller, makeSnapshot(true, 0.0, 1.0), leg_calc::ControlState::kRun);
+
+  // ω>0 为左转：右轮力矩 > 左轮（力矩差速）
+  EXPECT_LT(out.wheel_torque_ref[0], out.wheel_torque_ref[1]);
+}
+
+TEST(LegControlCore, WheelTorqueRespectsLimit)
+{
+  auto cfg = makeConfig();
+  cfg.wheel_torque_enable = true;
+  cfg.wheel_torque_max = 0.2;
+  leg_calc::LegController controller(cfg);
+  const auto out =
+    runUntil(controller, makeSnapshot(true, 20.0, 20.0), leg_calc::ControlState::kRun);
+
+  for (double tau : out.wheel_torque_ref) {
+    EXPECT_LE(std::abs(tau), cfg.wheel_torque_max + 1e-12);
+  }
 }
 
 TEST(LegControlCore, LeftTurnSlowsLeftWheel)

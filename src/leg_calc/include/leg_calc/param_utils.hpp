@@ -105,8 +105,9 @@ inline void readLqrWeights(
   }
   const double r_weight = detail::lookupParam(node, pending, "r_weight").as_double();
   if (!std::isfinite(r_weight) || !(r_weight > 0.0) ||
-    std::any_of(q_diag.begin(), q_diag.end(),
-    [](double q) {return !std::isfinite(q) || q < 0.0;}))
+    std::any_of(
+      q_diag.begin(), q_diag.end(),
+      [](double q) {return !std::isfinite(q) || q < 0.0;}))
   {
     throw std::invalid_argument("q_diag 必须有限且非负，r_weight 必须有限且为正");
   }

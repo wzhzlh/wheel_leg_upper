@@ -49,7 +49,7 @@ add_executable(command_param_node src/command_param_node.cpp)
 target_include_directories(command_param_node PRIVATE
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
 )
-ament_target_dependencies(command_param_node rclcpp std_msgs)
+ament_target_dependencies(command_param_node rclcpp std_msgs geometry_msgs)
 
 # 仿真 I/O 桥（仅仿真用）：补 IMU 姿态 + joint_target/wheel_target → effort 控制器命令
 add_executable(sim_bridge_node src/sim_bridge_node.cpp)

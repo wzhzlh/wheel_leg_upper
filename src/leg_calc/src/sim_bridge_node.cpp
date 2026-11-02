@@ -46,6 +46,13 @@
 namespace
 {
 
+/// 与 leg_control 热路径话题一致的 QoS：只保留最新一帧 + best_effort。
+/// 仿真侧同样只需要“最新指令”，丢帧由下一个周期（500 Hz）补上。
+rclcpp::QoS hotPathQoS()
+{
+  return rclcpp::QoS(rclcpp::KeepLast(1)).best_effort();
+}
+
 /// 用四元数 (w,x,y,z) 把向量从 body 系转到世界系
 std::array<double, 3> rotateByQuat(
   const std::array<double, 4> & q, const std::array<double, 3> & v)
@@ -89,6 +96,7 @@ public:
     imu_out_topic_ = declare_parameter("imu_out_topic", std::string("imu/data"));
     joint_target_topic_ = declare_parameter("joint_target_topic", std::string("joint_target"));
     wheel_target_topic_ = declare_parameter("wheel_target_topic", std::string("wheel_target"));
+    wheel_torque_topic_ = declare_parameter("wheel_torque_topic", std::string("wheel_torque"));
     joint_states_topic_ = declare_parameter("joint_states_topic", std::string("joint_states"));
     leg_cmd_topic_ =
       declare_parameter("leg_cmd_topic", std::string("leg_effort_controller/commands"));
@@ -134,14 +142,19 @@ public:
       imu_out_topic_, rclcpp::SensorDataQoS());
 
     // ---------------- 指令 ----------------
+    // 与 leg_control 热路径话题保持一致：best_effort + depth 1。
+    // （可靠订阅配 best_effort 发布端是匹配不上的，改一侧必须同时改另一侧）
     joint_target_sub_ = create_subscription<sensor_msgs::msg::JointState>(
-      joint_target_topic_, 10,
+      joint_target_topic_, hotPathQoS(),
       [this](const sensor_msgs::msg::JointState::SharedPtr msg) {onJointTarget(*msg);});
     wheel_target_sub_ = create_subscription<std_msgs::msg::Float64MultiArray>(
-      wheel_target_topic_, 10,
+      wheel_target_topic_, hotPathQoS(),
       [this](const std_msgs::msg::Float64MultiArray::SharedPtr msg) {onWheelTarget(*msg);});
+    wheel_torque_sub_ = create_subscription<std_msgs::msg::Float64MultiArray>(
+      wheel_torque_topic_, hotPathQoS(),
+      [this](const std_msgs::msg::Float64MultiArray::SharedPtr msg) {onWheelTorque(*msg);});
     joint_states_sub_ = create_subscription<sensor_msgs::msg::JointState>(
-      joint_states_topic_, 10,
+      joint_states_topic_, hotPathQoS(),
       [this](const sensor_msgs::msg::JointState::SharedPtr msg) {onJointStates(*msg);});
 
     // 启动门控状态（latched）：门控放开前不给轮子下发力矩，避免"挂架夹着、轮子空转"，
@@ -286,6 +299,17 @@ private:
     wheel_target_seen_ = true;
   }
 
+  /// 力矩通道（leg_control 的 wheel_torque_enable:=true 时才有非零值）
+  void onWheelTorque(const std_msgs::msg::Float64MultiArray & msg)
+  {
+    if (msg.data.size() < 2) {
+      return;
+    }
+    wheel_tau_ref_ = {msg.data[0], msg.data[1]};
+    last_wheel_torque_time_ = now();
+    wheel_torque_seen_ = true;
+  }
+
   void onJointStates(const sensor_msgs::msg::JointState & msg)
   {
     for (size_t i = 0; i < wheel_joint_order_.size() && i < 2; ++i) {
@@ -307,9 +331,9 @@ private:
     const bool fresh = leg_target_seen_ && wheel_target_seen_ &&
       (now() - last_ctrl_time_).seconds() <= command_timeout_;
     const double dt = 1.0 / std::max(1.0, cmd_rate_);
-    const bool wheel_armed = (wheel_arm_on_gate_ && gate_seen_)
-      ? gate_open_
-      : (first_pose_time_set_ && (pose_time_ - first_pose_time_) >= wheel_start_delay_);
+    const bool wheel_armed = (wheel_arm_on_gate_ && gate_seen_) ?
+      gate_open_ :
+      (first_pose_time_set_ && (pose_time_ - first_pose_time_) >= wheel_start_delay_);
 
     std_msgs::msg::Float64MultiArray leg_cmd;
     leg_cmd.data.assign(4, 0.0);
@@ -323,9 +347,13 @@ private:
     if (fresh && wheel_meas_seen_ && wheel_armed) {
       for (size_t i = 0; i < 2; ++i) {
         if (wheel_mode_ == "torque") {
-          // /wheel_target 直接当作轮轴力矩（leg_control 的 LQR 本来就是力矩输出）
+          // 优先用 /wheel_torque（leg_control 的力矩通道，单位 N·m）；
+          // 没收到时退回旧行为：把 /wheel_target 的数值当力矩
+          const bool tau_fresh = wheel_torque_seen_ &&
+            (now() - last_wheel_torque_time_).seconds() <= command_timeout_;
+          const auto & src = tau_fresh ? wheel_tau_ref_ : wheel_ref_;
           wheel_cmd.data[i] = std::clamp(
-            wheel_ref_[i] * wheel_torque_gain_, -wheel_tau_max_, wheel_tau_max_);
+            src[i] * wheel_torque_gain_, -wheel_tau_max_, wheel_tau_max_);
           continue;
         }
         const double err = wheel_ref_[i] - wheel_vel_[i];
@@ -348,6 +376,7 @@ private:
   std::string imu_out_topic_;
   std::string joint_target_topic_;
   std::string wheel_target_topic_;
+  std::string wheel_torque_topic_;
   std::string joint_states_topic_;
   std::string leg_cmd_topic_;
   std::string wheel_cmd_topic_;
@@ -386,18 +415,22 @@ private:
 
   std::array<double, 4> leg_effort_{0.0, 0.0, 0.0, 0.0};
   std::array<double, 2> wheel_ref_{0.0, 0.0};
+  std::array<double, 2> wheel_tau_ref_{0.0, 0.0};
   std::array<double, 2> wheel_vel_{0.0, 0.0};
   std::array<double, 2> wheel_i_{0.0, 0.0};
   bool leg_target_seen_{false};
   bool wheel_target_seen_{false};
+  bool wheel_torque_seen_{false};
   bool wheel_meas_seen_{false};
   rclcpp::Time last_ctrl_time_{0, 0, RCL_ROS_TIME};
+  rclcpp::Time last_wheel_torque_time_{0, 0, RCL_ROS_TIME};
 
   // ---------------- ROS 句柄 ----------------
   rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_raw_sub_;
   rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr pose_sub_;
   rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr joint_target_sub_;
   rclcpp::Subscription<std_msgs::msg::Float64MultiArray>::SharedPtr wheel_target_sub_;
+  rclcpp::Subscription<std_msgs::msg::Float64MultiArray>::SharedPtr wheel_torque_sub_;
   rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr joint_states_sub_;
   rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr start_gate_sub_;
 

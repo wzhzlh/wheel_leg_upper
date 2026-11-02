@@ -12,7 +12,7 @@
 
 > 阅读顺序建议：第 1~2 章看全局 → 第 3 章查文件 → 第 5 章跑起来 → 第 6 章调参 → 第 9/10 章看 VMC 与差速 → 第 11 章看分层控制与状态机。
 > 只想看仿真：直接跳到 **5.6 MuJoCo 仿真**（**先按那里的说明隔离 `ROS_DOMAIN_ID`**）；
-> 想知道“怎么一步步调成能稳稳站住”的完整过程与最终参数：**12.11**；附录 C 是 URDF/MJCF 的约定表。
+> 想知道"怎么一步步调成能稳稳站住"的完整过程与最终参数：**12.11**；附录 C 是 URDF/MJCF 的约定表。
 
 ---
 
@@ -21,7 +21,7 @@
 ```
   ┌───────────────────────┐   50 Hz   ┌──────────────────────────────────────┐
   │ command_param_node    │──────────►│ /robot_command                       │
-  │ 只改“上层意图”，不算控制 │  Float64  │ [v, ω, 质心高度, pitch, enable, estop] │
+  │ 只改"上层意图"，不算控制 │  Float64  │ [v, ω, 质心高度, pitch, enable, estop] │
   └───────────────────────┘           └──────────────┬───────────────────────┘
                                                      │
   /imu/data ────┐
@@ -33,8 +33,8 @@
                                                │ ④ 轮子控制 + 分配层（速度域）     │
                                                │ ⑤ 2D 里程计（轮弧长 + IMU yaw）→ /odom + TF │
                                                └───────┬───────────────┬──────────┘
-                                          /joint_target│      /wheel_target│
-                                           (effort=τ)  │     (ω_L, ω_R)   │
+                                          /joint_target│  /wheel_target + │
+                                           (effort=τ)  │  /wheel_torque   │
                                                        ▼                  ▼
                                                ┌──────────────────────────────────┐
                                                │ usb_drive_node          200 Hz   │
@@ -48,15 +48,15 @@
 ```
 
 三个频率互不等待：参数服务 50 Hz 只更新意图，USB 200 Hz 只搬运最近一帧，
-500 Hz 控制环只读最新快照；命令超时由状态机处理（降级 → 停机），不会被某个节点“卡住”。
+500 Hz 控制环只读最新快照；命令超时由状态机处理（降级 → 停机），不会被某个节点"卡住"。
 
 | 环节 | 包 / 节点 | 关键话题 |
 |---|---|---|
 | 上层命令（50 Hz） | `leg_calc/command_param_node` | 发布 `/robot_command` |
-| 统一控制（500 Hz） | `leg_calc/leg_control_node` | 订阅 `/imu/data` `/joint_states` `/robot_command`，发布 `/joint_target` `/wheel_target` `/odom` |
-| 通信（200 Hz） | `usb_drive` | 订阅 `/joint_target` `/wheel_target`，发布 `/joint_states` `/usb_drive/state` |
+| 统一控制（500 Hz） | `leg_calc/leg_control_node` | 订阅 `/imu/data` `/joint_states` `/robot_command`，发布 `/joint_target` `/wheel_target` `/wheel_torque` `/odom` |
+| 通信（200 Hz） | `usb_drive` | 订阅 `/joint_target` `/wheel_target` `/wheel_torque`，发布 `/joint_states` `/usb_drive/state` |
 | IMU 采集 | `imu_ros2_device` | 发布 `/imu/data` |
-| 通信协议 | `usb_drive` | 96 B 目标帧 / 208 B 状态帧 |
+| 通信协议 | `usb_drive` | 104 B 目标帧 / 208 B 状态帧 |
 | 物理仿真 | `mujoco_ros2_control` | `/joint_states`、`/leg_effort_controller/commands`、`/wheel_effort_controller/commands` |
 
 LQR 的推导、线性化与增益调度见第 6 章；足端 VMC 见第 9 章；分层控制与状态机见第 11 章。
@@ -134,7 +134,7 @@ LQR 的推导、线性化与增益调度见第 6 章；足端 VMC 见第 9 章�
 
 - **主链路只有一个启动入口**：`wheel_leg_control.launch.py`。旧的独立 LQR / VMC / 差速节点与
   `wheel_leg_bringup.launch.py` 已移除；所需算法仍在 `leg_calc` 的库和单元测试中。
-- `launch_pack` 只负责“把节点按正确参数拉起来”，不写业务逻辑。
+- `launch_pack` 只负责"把节点按正确参数拉起来"，不写业务逻辑。
 - `usb_drive` 是唯一的硬件出口：控制器只发话题，不直接碰 USB。
 - `leg_calc` 内部分四层：**算法库（lqr / foot_vmc / wheel_leg_model / control_state）
   → 数据类型（types）→ 控制核心（core，含轮速分配与里程计换算）
@@ -147,12 +147,12 @@ LQR 的推导、线性化与增益调度见第 6 章；足端 VMC 见第 9 章�
 | 文件 | 作用 |
 |---|---|
 | `task/task.h` | 上下位机协议结构体（`RobotState_t` / `RobotTarget_t`）、`JointCalib_t`、任务声明 |
-| `task/task.c` | 4 个 FreeRTOS 任务（优先级全为 1）：`wheel_control_task`（位置-速度串级 PID → M2006 电流，`vTaskDelayUntil` 3 ms ≈ 333 Hz）、`joint_control_task`（RobStride 运控帧，3 ms）、`state_send_task`（状态帧，10 ms = 100 Hz）、`target_receive_task`（命令接收）；`HAL_CAN_RxFifo0MsgPendingCallback` 里解析 0x201/0x202 与 RobStride 扩展帧 |
+| `task/task.c` | 4 个 FreeRTOS 任务（优先级全为 1）：`wheel_control_task`（**纯力矩直通**：`wheel[i].torque × WHEEL_COUNTS_PER_NM` → M2006 电流，**没有位置/速度环**；保留 target 帧超时、CAN 反馈超时、电流限幅三道保护，`vTaskDelayUntil` 3 ms ≈ 333 Hz）、`joint_control_task`（RobStride 运控帧，3 ms）、`state_send_task`（状态帧，10 ms = 100 Hz）、`target_receive_task`（命令接收）；两个控制任务都按整帧快照读 `rob_target`，并有 100 ms 链路看门狗；`HAL_CAN_RxFifo0MsgPendingCallback` 里解析 0x201/0x202 与 RobStride 扩展帧。轮子反馈（转子角度/转速 ÷ 36:1 减速比 → 轮轴量）只用于上报，不参与控制 |
 | `Core/Src/usb_trans.c` | CDC 接收组包（收到短包即视为一帧结束，缓冲 512 B） |
 | `Core/Inc/RobStride2.h` / `Core/Src/RobStride2.c` | RobStride 电机运动控制与反馈解析 |
 
 > 注意：固件当前**没有命令超时 / 看门狗**：USB 断开后 `rob_target` 保持最后一帧，
-> 轮子会继续按旧目标运行。上位机侧的 `usb_drive` 已用“状态帧超时 → 发安全帧”兜底（第 11 章），
+> 轮子会继续按旧目标运行。上位机侧的 `usb_drive` 已用"状态帧超时 → 发安全帧"兜底（第 11 章），
 > 但从安全设计上仍建议在固件里补一个 `target_age > 100 ms` 的失力动作。
 
 ---
@@ -176,7 +176,7 @@ LQR 的推导、线性化与增益调度见第 6 章；足端 VMC 见第 9 章�
 | `wheel_leg_model.hpp/.cpp` | 3 自由度拉格朗日模型：M(q)、C(q, q̇)、G(q)、T(q) → A、B。非线性 `stepRK4` 仅用于仿真验证。 |
 | `lqr.hpp/.cpp` | `solveLQR`（Riccati 迭代，连续 LQR）、`GainSchedule::gainAt(h)`（K(h) 调度）、`LegGeometry::comHeight(q)`。 |
 | `foot_vmc.hpp/.cpp` | **足端 VMC**：五杆闭链正/逆运动学 `T(q)`/`T⁻¹(x)`、雅可比 `J`、`J⁻ᵀJ`、足端虚拟弹簧阻尼 `F=Kp·Δp−Kd·ṗ`、`τ=JᵀF`、`computeVmcLeg` 一站式接口。 |
-| `control_state.hpp` | **状态机 + 安全监督（第 11 章）**：`ControlState{kInit,kIdle,kRun,kDegraded,kFault}`、`FaultBits`、`SafetySupervisor::update(SafetyInputs) → SafetyStatus`；含姿态类故障“保平衡 + 自动恢复”与倒伏判据（11.3）。纯逻辑、不依赖 ROS。 |
+| `control_state.hpp` | **状态机 + 安全监督（第 11 章）**：`ControlState{kInit,kIdle,kRun,kDegraded,kFault}`、`FaultBits`、`SafetySupervisor::update(SafetyInputs) → SafetyStatus`；含姿态类故障"保平衡 + 自动恢复"与倒伏判据（11.3）。纯逻辑、不依赖 ROS。 |
 | `robot_command.hpp` | `/robot_command` 的字段定义（`v, ω, 质心高度, pitch目标, enable, estop`），发布端与接收端共用同一份下标。 |
 | `leg_control_types.hpp` | 控制层的数据契约：`ControllerConfig`（全部可调参数）、`StateSnapshot`（传感器 + 命令 + 健康度）、`ControlOutput`（力矩/轮速/状态）。 |
 | `leg_control_core.hpp/.cpp` | **控制核心**：`LegController::step(snapshot,dt)`，内含 h 估计、LQR、双腿 VMC、轮子分配、状态机推进；不依赖 ROS。 |
@@ -194,8 +194,8 @@ LQR 的推导、线性化与增益调度见第 6 章；足端 VMC 见第 9 章�
 | 文件 | 作用 |
 |---|---|
 | `cdc_trans.hpp/.cpp` | **传输层（收发 + 拆帧）**。`CdcTrans`：libusb 封装，按 VID/PID 打开、卸载 `cdc_acm`、抢占接口、异步 bulk 接收（循环重提交）、同步 bulk 发送、热插拔注册、掉线 500 ms 自动重连；`close()` 会先取消传输并等回调结束再释放，避免 use-after-free。`FrameAssembler`：定长帧重组，USB bulk 会粘包/拆包，按 208 B 累积切帧；`reset()` 可在回调内安全调用（失步重同步）。 |
-| `data_pack.h` | 与固件逐字节一致的协议：`Wheel_t`(8B)、`JointTarget_t`(20B)、`JointState_t`(48B)、`RobotTarget_t`(**96B**)、`RobotState_t`(**208B**)。带 `static_assert` 卡死长度与字段偏移。 |
-| `usb_drive_node.cpp` | 通信节点，**默认 200 Hz** 下发（只搬运，不做控制计算）：下行把 `/wheel_target`（轮速）积分成角度目标 + 速度目标、把 `/joint_target` 打包成 4 关节运控目标；上行解析状态帧，发布 `joint_states`(2 轮 + 4 关节)、`usb_drive/state`(原始量)。**不发布 odom**（里程计由控制层换算）。三重兜底：① 指令超时 → 轮子位置保持、关节失力；② **状态帧超时（`state_timeout`，默认 0.5 s）→ 立即改发安全帧**；③ 退出时下发一次安全帧。`left/right_invert` 在上下行**同时**生效。 |
+| `data_pack.h` | 与固件逐字节一致的协议：`Wheel_t`(8B)、`WheelTarget_t`(12B)、`JointTarget_t`(20B)、`JointState_t`(48B)、`RobotTarget_t`(**104B**)、`RobotState_t`(**208B**)。带 `static_assert` 卡死长度与字段偏移（协议的唯一来源，节点里不再重复断言）。 |
+| `usb_drive_node.cpp` | 通信节点，**默认 200 Hz** 下发（只搬运，不做控制计算）：下行把 `/wheel_torque`（**主力矩通道 `[τ_L, τ_R]`**，`wheel_torque_gain` 默认 1.0）、`/wheel_target`（轮速参考，实机已不参与执行，仅仿真桥使用）、`/joint_target`（位置/速度/力矩/kp/kd）打包成 104 B 帧；上行解析状态帧，发布 `joint_states`(2 轮 + 4 关节)、`usb_drive/state`(原始量)。**不发布 odom**（里程计由控制层换算）。三重兜底：① 指令超时 → 力矩/轮速参考归零、关节失力；② **状态帧超时（`state_timeout`，默认 0.5 s）→ 立即改发安全帧**（轮子按 `τ = −safe_damp_torque·ω` 阻尼制动，因为固件没有位置环、纯 0 力矩会溜坡）；③ 退出时下发一次安全帧。`left/right_invert` 在上下行**同时**生效，力矩也乘 `dir`。`max_wheel_torque`(默认 1.0 N·m) 收到即限幅。 |
 | `test/test_frame_assembler.cpp` | 5 个单测：协议布局、粘包、拆包、残帧、回调内 reset。 |
 
 ### 3.4 launch_pack
@@ -237,9 +237,11 @@ LQR 的推导、线性化与增益调度见第 6 章；足端 VMC 见第 9 章�
 |---|---|---|---|
 | `/imu/data` | `sensor_msgs/Imu` | 驱动 → 控制器 | 四元数 + 角速度，frame 由 `imu_frame_id` 决定 |
 | `/joint_states` | `sensor_msgs/JointState` | 通信 → 控制器 | 2 轮 + 4 关节（名称见参数） |
-| `/joint_target` | `sensor_msgs/JointState` | 控制器 → 通信 | 4 个腿关节的 `position/velocity/effort`；`effort` 由 VMC 写入（力矩） |
-| `/wheel_target` | `Float64MultiArray` | 控制器 → 通信 | `[左轮, 右轮]` 目标角速度 [rad/s]，由分配层合成 |
+| `/joint_target` | `sensor_msgs/JointState` | 控制器 → 通信 | 4 个腿关节的运控帧内容：`position` = 足端目标 IK 得到的目标角，`velocity` = 目标角速度（准静态为 0），`effort` = VMC 力矩。`joint_kp/kd=0` 时只有 `effort` 生效 |
+| `/wheel_target` | `Float64MultiArray` | 控制器 → 通信 | `[左轮, 右轮]` 目标角速度 [rad/s]，由分配层合成。**实机固件已不做速度环，这条已不参与执行**；只有仿真桥（`sim_bridge`）还把它当力矩用 |
+| `/wheel_torque` | `Float64MultiArray` | 控制器 → 通信 | `[τ_L, τ_R]` 轮轴力矩 [N·m]，**实机主通道**：`τ = u + k_vel_p·(v_des − ẋ) ∓ τ_yaw`（`input_mode=force` 时自动乘 r），左右可分 → 力矩差速转向；非平衡态（未使能/FAULT）时是 `−wheel_brake_damp·ω` 阻尼制动。经 `usb_drive` 的 `wheel_torque_gain`(默认 1.0) 进入帧里的 `wheel[i].torque` |
 | `/robot_command` | `Float64MultiArray` | 参数服务 → 控制器 | `[v, ω, 质心高度, pitch目标, enable, estop]`（50 Hz，格式见 `robot_command.hpp`） |
+| `/cmd_vel` | `geometry_msgs/Twist` | 上层 → 参数服务 | 速度命令：`linear.x` 线速度 [m/s]、`angular.z` 偏航角速度 [rad/s]；收到即切 TELEOP，超过 `cmd_vel_timeout` 没有新消息就归零 |
 | `/odom` | `nav_msgs/Odometry` | 控制器 → 调试 | 2D 里程计：`x/y` 由轮弧长沿 IMU yaw 分解，朝向取 IMU yaw（减初始零位）；同时发布 `odom→base_link` 的 `/tf` |
 | `/usb_drive/state` | `Float64MultiArray` | 调试 | 原始反馈（轮角/轮速 + 4 关节角/角速度） |
 | `/leg_control/state` | `Float64MultiArray` | 调试 | `[state, faults, θ, θ̇, x, ẋ, u, h, h_cmd, τ0..τ3, ω_L, ω_R]` |
@@ -445,9 +447,13 @@ ros2 topic echo /base_link_pose_sensor/pose
 - `u_max: 0.40`（轮地摩擦上限）远小于 MJCF 的 ±3，跑闭环时不会撞到 `ctrlrange`；`joint_torque_max: 8.0`
   同理低于髋的 ±12。
 - `use_sim_time`：launch 没有统一打开。要让 `leg_calc` 吃仿真时间，需要给节点加 `-p use_sim_time:=true`，否则它用墙钟，和 `/clock` 会不同步。
+- **`enable` 默认是关的**：launch 的 `enable` 参数默认 `false`（会覆盖 YAML 里的 `enable: true`），
+  所以直接 `ros2 launch` 后机器人不动是正常的。使能：
+  `ros2 param set /command_param enable true`（或 `enable:=true` 直接启动）。
+  `command_param` 启动时会把当前 enable 状态和这句命令打进日志。
 - **轮子力矩什么时候开始下发**：`sim_bridge` 现在订阅门控的 latched 话题 `/mujoco/start_gate_open`，
   物理步进真正放开的那一刻才给轮子力矩（`wheel_arm_on_gate: true`）。以前用固定
-  `wheel_start_delay=1.45 s` 计时，而门控放开时间在 1.12～1.60 s 之间浮动，会出现“挂架还夹着、轮子先转”，
+  `wheel_start_delay=1.45 s` 计时，而门控放开时间在 1.12～1.60 s 之间浮动，会出现"挂架还夹着、轮子先转"，
   启动瞬态一度冲到 x=0.44 m；改成跟门控后启动瞬态只有 x∈[−0.007, 0.055]、θ∈[−0.017, 0.003]。
 
 
@@ -516,17 +522,20 @@ ros2 topic echo /wheel_target    # 直行两轮同号，左转左轮 < 右轮
 |---|---|---|---|
 | `cart_mass` M | 两轮质量之和 [kg] | `lefoot_link` + `rifoot_link` 的 `<mass>` | 0.285（0.130114 + 0.155050） |
 | `pendulum_mass` m | 除两轮外 9 个连杆质量之和 [kg] | 1.667452(base) + 0.077208(4 曲柄) + 0.159329(4 连杆) | 1.904 |
-| `com_length` h | **轮轴到摆杆质心**距离 [m] | home 姿态合成质心 z − 轮轴 z | 0.0834（0.115454 − 0.032089） |
-| `com_inertia` I | 摆杆绕自身质心 pitch 惯量 [kg·m²] | 各连杆 izz 投影到 base 的 y 轴 + 平行轴项 `m·d²` | 0.00255 |
+| `com_length` h | **轮轴到摆杆质心**距离 [m] | home 姿态合成质心 z − 轮轴 z | **0.0343**（0.066210 − 0.031909，2026-11-01 新零位） |
+| `com_inertia` I | 摆杆绕自身质心 pitch 惯量 [kg·m²] | 各连杆绕轮轴 Y 的惯量之和 − `m·h²` | **0.001793**（绕轴 4.033e-3） |
 | `wheel_radius` r | 轮半径 [m] | 轮子 STL 的轮胎外缘（MJCF 接触圆柱用 0.032 是软接触近似） | 0.030 |
-| `wheel_inertia` Jw | 两轮绕轮轴等效转动惯量 [kg·m²] | 两轮 `izz` 之和（轮轴平行连杆 z 轴，质心只沿轴向偏 34 mm，不改 izz） | 5.32e-5（2.339e-5 + 2.983e-5） |
+| `wheel_inertia` Jw | 两轮绕轮轴等效转动惯量 [kg·m²] | 两轮 `Iyy` 之和 | **4.213e-5** |
 
-> 等效平动质量 `M_eff = M + Jw/r²` 由代码内部计算，不用手填（当前 = 0.285 + 5.32e-5/0.03² = 0.344 kg）。
+> 等效平动质量 `M_eff = M + Jw/r²` 由代码内部计算，不用手填（当前 = 0.285 + 4.213e-5/0.03² = 0.332 kg）。
 
-> **home 姿态 ≠ 关节全零**：URDF 的左右腿零位不对称，关节全零时左轮比右轮高 13.5 mm（`wheel_leg.xml`
-> 的 `keyframe "home"` 注释里有实测值），要用 MJCF home 那组角算：左腿全零、
-> `rf1=-0.2259 / rf2=+0.3339 / rb1=+0.2301 / rb2=-0.3302`。图省事用全零会把轮轴高度算成 0.0254 m，
-> h 从 0.0834 变成 0.0895（偏大 7%）。
+> **2026-11-01 换了关节零位，home 姿态是深蹲**：URDF 四条髋关节的 rpy 改成
+> `lf1 -1.1 / lb1 +0.79 / rf1 -1.15 / rb1 +1.1`（四个膝关节的 yaw 同步重定），MJCF 的 body quat 与
+> keyframe 也一起对齐（keyframe 现在**所有 hinge = 0**，`qpos[2] = -0.938859`）。
+> 结果：home 的 `foot_y = 0.0612`、`h = 0.0343`（旧零位是 0.1172 / 0.0834），腿是折起来的。
+> 站立仍然靠 `com_height_default = 0.0834`（换算 `foot_y = 0.1123`）把腿撑开，冷启动时
+> 门控阶段（~1 s）就会伸腿到位，实测放开后 h 直接是 0.069。
+> 两轮静态高度差从 13.5 mm 降到 **3.98 mm**（左 0.033900 / 右 0.029918，轮接触半径 0.032）。
 
 ### 6.2 θ 的零位：`theta_offset`
 
@@ -553,6 +562,7 @@ ros2 param set /leg_control theta_offset 0.02
 | 减少来回晃动、抑制速度 | 增大 `q_ẋ`、`q_θ̇`（默认 10 / 5） |
 | 省力、动作更柔和 | 减小 `q_θ` 或增大 `r_weight` |
 | 抖动/嗡鸣 | 增大 `r_weight`（=1 → 3~10），或降 `control_rate` |
+| `控制环最坏执行时间 xx ms 超过 2 ms 周期` | 这是**回调内墙钟时间**，说明进程被抢占/阻塞，不是算不动：单线程 executor 里既有 500 Hz 控制、又有 IMU 200 Hz / joint_states 300 Hz 订阅，再叠加 `/odom`+TF+`/leg_control/state` 每条 500 Hz 的发布，订阅端（rviz2、`topic echo`）跟不上就会反压。处理顺序：① `debug_rate` 降到 100（默认已降）② 关掉 rviz2/echo ③ `chrt -f 50` 或 `taskset` 绑核、CPU governor 设 performance ④ 确认没有 gdb/ST-Link 调试器把进程 halt |
 
 经验：默认 `q_diag = [100, 600, 10, 5]`，即 `q_θ : q_x ≈ 6:1`；想更"站得死"就往 `[100, 2000, 10, 1]`
 （50:1）那侧调。`r_weight` 从 1 开始，翻倍调。
@@ -564,7 +574,7 @@ ros2 param set /leg_control q_diag "[20.0, 2000.0, 1.0, 1.0]"
 # 参数回调会重新求解并在日志里打印名义高度处的 K
 ```
 
-**关键：增益必须和 `u_max` 匹配，否则“站住”只是极限环（2026-10-30 实测）**
+**关键：增益必须和 `u_max` 匹配，否则"站住"只是极限环（2026-10-30 实测）**
 
 `q_diag=[50,500,10,1]` 解出的 `K≈[−7.07, −27.1, −6.9, −1.7]`，而 `u_max=0.4 N·m`：
 俯仰到 **0.015 rad（0.9°）** 力矩就饱和。机器人不会倒，但会进入 **±0.3 m 的极限环**
@@ -572,7 +582,7 @@ ros2 param set /leg_control q_diag "[20.0, 2000.0, 1.0, 1.0]"
 （`K≈[−1.18, −4.52, −1.16, −0.28]`）后饱和降到 **0%**，稳态 x∈[0.020,0.030]、θ≈−0.006、u≈±0.01。
 
 原因是这台车稳住倒立摆只需要 `k_θ ≳ 0.66 N·m/rad`（见附录 A 的 `mgh` 与 `B`），而 LQR 给 27 相当于
-“要求 0.9° 内就回到零”，执行器做不到，于是全程 bang-bang。**判据**：正常站立时
+"要求 0.9° 内就回到零"，执行器做不到，于是全程 bang-bang。**判据**：正常站立时
 `/leg_control/state[6]`（即 `u`）应接近 0；长期贴边就把 K 整体缩小（或增大 `r_weight`）。
 
 本仓库现在用 `gain_mode: quadratic` + `k_coeffs` 只填常数项，把这个 1/6 增益直接写死：
@@ -592,7 +602,7 @@ k_coeffs: [0.0,0.0,-1.18,  0.0,0.0,-4.52,  0.0,0.0,-1.16,  0.0,0.0,-0.28]
 
 调试时可临时调小 `u_max`（如 0.1）再逐步放开；要真的验证轮子能出多大力，直接给 `/wheel_target`。
 
-**先缩增益，再考虑抬 `u_max`**。2026-10-30 的极限环就是“增益过大”这一条（见 6.3）。
+**先缩增益，再考虑抬 `u_max`**。2026-10-30 的极限环就是"增益过大"这一条（见 6.3）。
 如果确实需要更大控制权限：场景地面 `friction=1.2`、总法向力约 21 N，理论上限 `μ·N·r ≈ 0.76 N·m`，
 抬到 0.5～0.6 还能留 20%～35% 的摩擦余量；再高就开始打滑，`/odom` 和 LQR 的 `x/ẋ` 会先失真。
 
@@ -600,7 +610,8 @@ k_coeffs: [0.0,0.0,-1.18,  0.0,0.0,-4.52,  0.0,0.0,-1.16,  0.0,0.0,-0.28]
 
 上位机现在走**五杆**：由 4 个髋关节角经 `joint_sign/joint_offset` 换成 α/β → 五杆正运动学得足端
 `foot_y`（髋轴到轮轴的竖直距离）→ `h = foot_y + com_offset`（左右腿取平均，再用 `h_min/h_max` 截断）。
-`com_offset` 是「摆杆质心相对髋轴的竖直偏置」，质心在髋下方为**负**（当前 −0.0338 m）。
+`com_offset` 是「摆杆质心相对髋轴的竖直偏置」，质心在髋下方为**负**（当前 **−0.0289 m**，
+2026-11-01 换零位后：髋 z 0.09514 − 摆杆质心 z 0.06621；旧零位是 −0.0338）。
 
 `thigh` / `shank` 只剩 `LegGeometry::comHeight()` 这个串联 2R 接口在用（单测和遗留调用），
 不再参与 `h` 的计算，值保持 0.15/0.15 即可，改腿长不用管它们。
@@ -649,7 +660,7 @@ h[m],k_x,k_theta,k_x_dot,k_theta_dot
 ```
 
 > ⚠ 上面这段数字是**旧模型**（`h≈0.18 m`、`M=0.31/m=1.90`）拟合出来的，只作格式示例。
-> 现在 `h` 的实际工作区间是 0.065~0.100（home 0.0834）、模型参数也换成了 URDF 值，
+> 现在 `h` 的实际工作区间是 0.065~0.100（新零位 home 0.0343，站立目标 0.0834）、模型参数也换成了 URDF 值，
 > 要切 `quadratic` 必须用当前 `q_diag/r_weight` 重新扫描拟合，否则 K 会明显偏。
 
 **第 2 步：填进 `config/leg_control_params.yaml` 的 `k_coeffs`**（行序 = `[k_x, k_theta, k_x_dot, k_theta_dot]`，列序 = `[h², h, 1]`），并把 `gain_mode` 设为 `quadratic`。
@@ -671,18 +682,29 @@ ros2 param set /leg_control k_coeffs "[0,0,0, 0,0,0, 0,0,0, 0,0,0]"
 
 ### 6.7 轮子方向与限幅
 
+**实机主通道是力矩（`/wheel_torque`）**：固件 `wheel_control_task` 已经删掉位置/速度环，
+直接把帧里的 `wheel[i].torque [N·m]` 按 `WHEEL_COUNTS_PER_NM` 换成 M2006 电流。
+所以平衡、行驶、转向全部在上位机算好，`/wheel_target`（ω）在实机上已不参与执行
+（只有仿真桥还会把它当力矩用）。
+
 | 参数（`usb_drive`） | 默认 | 说明 |
 |---|---|---|
-| `left_invert` / `right_invert` | false | 左右轮镜像，上下行同时生效 |
-| `max_wheel_omega` | 20.0 | 轮速限幅 [rad/s]（最后一道） |
+| `left_invert` / `right_invert` | false | 左右轮镜像，上下行 + 力矩同时生效 |
+| `wheel_torque_gain` | 1.0 | `/wheel_torque` → 帧里 `wheel[i].torque` 的缩放。**1.0 = 力矩通道打开**（实机必须）；0 = 关掉，轮子只剩安全帧制动 |
+| `max_wheel_torque` | 1.0 | 单轮力矩限幅 [N·m]（gain 之后逐值 clamp） |
+| `safe_damp_torque` | 0.02 | 安全帧阻尼制动系数 [N·m per rad/s]，`τ = −k·ω`；0 = 轮子自由滚（会溜坡） |
+| `max_wheel_omega` | 20.0 | 轮速限幅 [rad/s]（只作用于 `/wheel_target` 这条速度通道） |
 
-控制层（`leg_control`）：
+控制层（`leg_control`）力矩通道：
 
 | 参数 | 默认 | 说明 |
 |---|---|---|
-| `balance_torque_to_omega` | 1.0 | LQR 力矩 → 轮速折算 [rad/s per N·m]，实机标定 |
-| `max_balance_omega` | 8.0 | 平衡分量限幅 [rad/s] |
-| `max_drive_omega` | 12.0 | 行驶分量限幅 [rad/s] |
+| `wheel_torque_max` | 0.40 | 单轮力矩总限幅 [N·m]，平衡 + 行驶 + 转向之和（≈轮地摩擦 μ·N·r） |
+| `k_vel_p` | 1.0 | 线速度误差 P [N·m per m/s]：`τ_v = k_vel_p·(v_des − ẋ)`，左右同相 |
+| `k_yaw_p` | 0.15 | 偏航角速度误差 P [N·m per rad/s]：左右反相，差速转向 |
+| `yaw_ff` | 0.06 | 偏航角速度前馈 [N·m per rad/s]，左右差动力矩 |
+| `wheel_brake_damp` | 0.02 | 非平衡态（未使能 / FAULT）阻尼制动 [N·m per rad/s] |
+| `balance_torque_to_omega` | 1.0 | LQR 力矩 → 轮速折算 [rad/s per N·m]，**现在只影响 `/wheel_target`**（仿真/诊断），不再参与实机执行 |
 
 改轮速前先确认 `odom` 里的 `x` 方向与实物一致（推车向前 `x` 增大），否则 `left/right_invert` 反了。
 
@@ -694,8 +716,11 @@ ros2 param set /leg_control k_coeffs "[0,0,0, 0,0,0, 0,0,0, 0,0,0]"
 | `interface` / `ep_in` / `ep_out` | 1 / 0x81 / 0x01 | CDC 数据接口与端点，一般不用改 |
 | `send_rate` | 200 | 下行帧率（5 ms），低于固件控制环频率即可，不要低于 50 |
 | `state_timeout` | 0.5 | 状态帧超时 [s]，超时立即改发安全帧 |
-| `command_timeout` | 0.3 | 轮速/关节指令超时 [s]，超时后轮子位置保持、关节失力 |
-| `joint_kp` / `joint_kd` | 0 / 0 | 关节运控 PD；0 表示纯力矩（VMC 模式） |
+| `command_timeout` | 0.3 | 轮速/力矩/关节指令超时 [s]，超时后轮子力矩与轮速参考归零、关节失力 |
+| `wheel_torque_gain` | 1.0 | `/wheel_torque` → 帧里 `wheel[i].torque` 的缩放。**默认 1.0 = 力矩通道打开**（固件已无轮环，实机必须为 1）；置 0 则轮子没有力矩指令 |
+| `max_wheel_torque` | 1.0 | 力矩通道限幅 [N·m]（gain 之后逐值 clamp） |
+| `safe_damp_torque` | 0.02 | 安全帧（状态帧超时 / 退出）里的阻尼制动系数 [N·m per rad/s]，`τ = −k·ω` |
+| `joint_kp` / `joint_kd` | 0 / 0 | 关节运控 PD（单位 N·m/rad、N·m·s/rad）。**0 = 纯力矩（VMC 模式，与仿真一致）**；非 0 时就变成 MIT 模式，此时 `/joint_target` 的 `position` 必须是目标角（IK 已经填好了） |
 
 免 sudo 访问（可选）：
 
@@ -709,26 +734,29 @@ sudo udevadm control --reload-rules && sudo udevadm trigger
 
 | 组 | 参数 | 默认 |
 |---|---|---|
-| 频率 | `control_rate` | 500 Hz |
-| 模型 | `cart_mass` / `pendulum_mass` / `com_length` / `com_inertia` / `wheel_radius` / `wheel_inertia` | 0.285 / 1.904 / 0.0834 / 0.00255 / 0.030 / 5.32e-5（URDF 推导，见 6.1） |
+| 频率 | `control_rate` / `debug_rate` | 500 Hz / **100 Hz**（`/odom` + TF + `/leg_control/state` 的发布频率，0 = 不发） |
+| 模型 | `cart_mass` / `pendulum_mass` / `com_length` / `com_inertia` / `wheel_radius` / `wheel_inertia` | 0.285 / 1.904 / **0.0343** / **0.001793** / 0.030 / **4.213e-5**（URDF/MJCF 实测，见 6.1） |
 | 权重 | `q_diag` / `r_weight` | [50, 500, 10, 1] / 1.0（`quadratic` 模式下不参与计算，只作参考） |
-| 增益 | `gain_mode` / `k_coeffs` / `h_min` / `h_max` | quadratic / `[−1.18, −4.52, −1.16, −0.28]` 的常数项（LQR 的 1/6，见 6.3）/ 0.06 / 0.12；`online_lqr` 仍可用，k_coeffs 全零即退回 |
-| 高度 | `com_height_default` / `_min` / `_max` / `com_offset` / `use_measured_height` | 0.0834 / 0.065 / 0.100 / -0.0338 m / true |
+| 增益 | `gain_mode` / `k_coeffs` / `h_min` / `h_max` | quadratic / `[−1.18, −4.52, −2.00, −0.28]` 的常数项（LQR 的 1/6，见 6.3；`k_x_dot` 上限 ≈2.1，见 12.13）/ 0.06 / 0.12；`online_lqr` 仍可用，k_coeffs 全零即退回 |
+| 高度 | `com_height_default` / `_min` / `_max` / `com_offset` / `use_measured_height` | 0.0834 / 0.065 / 0.100 / **-0.0289** m / true |
 | 平衡 | `theta_axis` / `theta_offset` / `u_max` | pitch / 0.0 / 0.40 N·m |
 | VMC | `l1..l5` / `kp_x,kp_y` / `kd_x,kd_y` / `force_max_*` / `joint_torque_max` / `joint_torque_sign` | 见第 9 章 |
 | 关节角标定 | `joint_sign` / `joint_offset`（4 个数，α/β = sign·q + offset） | 见 12.7 |
 | 高度斜坡 | `com_height_rate` | 0.30 m·s⁻¹ |
-| 轮子 | `wheel_separation` / `max_wheel_omega` / `max_balance_omega` / `max_drive_omega` / `balance_torque_to_omega` / `balance_leak_rate` | 0.305 / 20 / 8 / 12 / 1.0 / 60 s⁻¹（力矩指令一阶低通，60 ≈ 8 ms） |
+| 轮子 | `wheel_torque_max` / `k_vel_p` / `k_yaw_p` / `wheel_brake_damp` / `yaw_ff` / `k_vel_i` / `k_yaw_i`（力矩通道） | 0.40 / **1.0** / **0.15** / **0.02** / **0.06** / **0.0（关）** / **0.0（关）** |
+| 轮子（仅 `/wheel_target` 速度通道 = 仿真） | `wheel_radius` / `max_wheel_omega` / `max_balance_omega` / `max_yaw_rate` / `k_yaw` / `wheel_damp_ff` / `balance_torque_to_omega` / `balance_leak_rate` | 0.03 / 20 / 8 / **3.0（仿真 launch 覆盖成 0.20，见 12.13）** / 0.0 / **0.016** / **1.0** / 60 s⁻¹ |
 | 安全 | `imu_timeout` / `joint_state_timeout` / `command_timeout` / `command_fault_timeout` / `max_pitch` / `max_pitch_rate` / `startup_cycles` | 0.10 / 0.10 / 0.30 / 1.00 s / **0.35 rad（20°）** / **3.0** / 250 |
-| 话题 | `imu_topic` / `joint_states_topic` / `command_topic` / `joint_target_topic` / `wheel_target_topic` / `odom_topic` | imu/data / joint_states / robot_command / joint_target / wheel_target / odom |
+| 话题 | `imu_topic` / `joint_states_topic` / `command_topic` / `joint_target_topic` / `wheel_target_topic` / `wheel_torque_topic` / `odom_topic` | imu/data / joint_states / robot_command / joint_target / wheel_target / wheel_torque / odom |
 | 参数服务 | `enable` / `teleop` / `estop` / `linear_velocity` / `yaw_rate` / `com_height` / `pitch_target` | false / false / false / 0.0 / 0.0 / 0.0834 / 0.0 |
-| 参数服务启动配置 | `command_topic` / `publish_rate` / `max_linear` / `max_yaw` / `com_height_min` / `com_height_max` / `max_pitch_target` | robot_command / 50 Hz / 1.0 / 3.0 / 0.065 / 0.100 / 0.20 |
+| 参数服务启动配置 | `command_topic` / `publish_rate` / `max_linear` / `max_yaw` / `com_height_min` / `com_height_max` / `max_pitch_target` | robot_command / 50 Hz / 1.0 / 3.0 / 0.065 / 0.100 / 0.30 |
+| 上层速度命令 | `cmd_vel_topic` / `use_cmd_vel` / `cmd_vel_timeout` / `max_linear_accel` / `max_yaw_accel` | cmd_vel / true / 0.5 s / 0.30 m·s⁻² / 1.0 rad·s⁻² |
 
 `leg_control` 的控制参数支持 `ros2 param set /leg_control <名字> <值>`；上层指令参数则通过
 `ros2 param set /command_param <名字> <值>` 或 rqt 修改，非法值会被拒绝并返回原因。
 
-**物理参数只有一个权威来源**：`wheel_radius`、`wheel_separation` 只在这一个文件出现一次，
-分配层与 `/odom` 都用它；`usb_drive` 不再读取任何物理量。
+**物理参数只有一个权威来源**：`wheel_radius` 只在这一个文件出现一次，分配层与 `/odom` 都用它；
+`usb_drive` 不读取任何物理量。（`wheel_separation` 已删除：轮距反解的偏航角速度没人用，
+`/odom` 的 yaw 直接取 IMU。）
 
 ---
 
@@ -737,18 +765,18 @@ sudo udevadm control --reload-rules && sudo udevadm trigger
 | 现象 | 原因 | 处理 |
 |---|---|---|
 | `dlsym`/`libusb` 打开失败 | `cdc_acm` 占用或权限不足 | 节点会自动 `detach_kernel_driver`；仍失败就加 udev 规则 |
-| 一直收到“非法状态帧” | 收到残缺/噪声帧 | 会自动丢缓冲重同步；持续出现请检查 USB 线与波特率 |
+| 一直收到"非法状态帧" | 收到残缺/噪声帧 | 会自动丢缓冲重同步；持续出现请检查 USB 线与波特率 |
 | `/leg_control/state` 的 state 一直是 0（INIT） | IMU / `joint_states` 没到，或 QoS 不匹配 | `ros2 topic hz /imu/data /joint_states`；`joint_states` 订阅是 reliable |
 | 状态在 RUN/DEGRADED 之间跳 | `/robot_command` 没有稳定 50 Hz | `ros2 topic hz /robot_command`；确认 `command_param_node` 在运行 |
 | 使能后停在 IDLE | 需要连续 `startup_cycles` 个健康周期（0.5 s） | 看 `state[1]` 故障位，先解决传感器超时 |
 | FAULT 后关闭急停也不恢复 | 故障锁存 | 先把 `/command_param/enable` 设为 false，再重新设为 true |
 | rqt 里找不到 `/command_param` | 参数节点未启动或不在同一 ROS domain | 检查 `use_command_server` 与 `ROS_DOMAIN_ID` |
-| 机器人“一上电就疯转” | `theta_offset` 没标定 | 先 `enable_motor:=false` 调零 |
+| 机器人"一上电就疯转" | `theta_offset` 没标定 | 先 `enable_motor:=false` 调零 |
 | 姿态符号反 | `theta_axis` 与 IMU 安装不匹配 | 切 `pitch`/`roll` 或改 `theta_offset` |
 | 轮子反向 / odom 方向反 | `left/right_invert` 与实物不符 | 改 `usb_drive` 参数，上下行同时生效 |
-| 一使能就往前冲 | `balance_torque_to_omega` 符号错 | 取负再试；确认 IMU 的 pitch 正方向 |
+| 一使能就往前冲 | `u` 的符号或 IMU 的 pitch 正方向反 | `/wheel_torque` 的符号（`left/right_invert` 已含 `dir`）；确认 IMU 的 pitch 正方向 |
 | 车不动、腿抖 | VMC `kp_x` 太大，和轮子抢位置 | 降低 `kp_x`（见第 9 章） |
-| 腿朝天上“拱” | 固件 `joint_calib` 零位/方向错，或 VMC 装配分支错 | 先核对 `α=β=90°` 时足端位置，再改 `foot/front/rear_branch` |
+| 腿朝天上"拱" | 固件 `joint_calib` 零位/方向错，或 VMC 装配分支错 | 先核对 `α=β=90°` 时足端位置，再改 `foot/front/rear_branch` |
 | 仿真里腿关节不动 | actuator 是 position 不是 effort | 见 5.6 |
 | 仿真里轮子越跑越快 | 浮动基座无力矩平衡，正常 | 需要闭环控制 |
 | 一 launch 机器人就自由落体、落地被弹飞 6~8 m | 控制器就绪前就开始积分物理 | 开启动门控，见 **12.2** |
@@ -767,29 +795,38 @@ sudo udevadm control --reload-rules && sudo udevadm trigger
 | 日志里 `FAULT 0x08` 紧跟着一条 `FAULT 0x00` | 正常：进入 FAULT 后 `controlling=false`，姿态检查被跳过，掩码重算成 0，但状态仍是 FAULT | 不用管；姿态回正后会自动回 RUN，见 11.3 |
 | 大幅度推一下之后机器人被判倒伏、失力 | 瞬态角速度超过 `3 × max_pitch_rate = 9 rad/s`，视为不可救 | 想多挣扎就调大 `kFallPitchFraction/kFallRateFraction`（11.3） |
 | 启动瞬态前冲（x 冲到 0.4 m） | 轮子力矩在门控放开之前就下发，挂架夹着时空转 | `wheel_arm_on_gate: true`，见 5.6 与 12.2 |
+| `enable` 了但电机没反应 | ① launch 的 `enable` 默认 false；② 同 domain 污染让状态卡在 INIT | 先看 `command_param` 启动日志里的 enable 状态；再按 5.6 隔离 domain |
+| 发了速度命令机器人冲出去/倒地 | 仿真里 `/wheel_target` 被当成力矩，速度指令直接变成大扭矩 | 命令从 0.1 m/s 起试，注意 `max_yaw_rate` 先留 0.20；见 11.4 |
 
 ---
 
 ## 8. 已知限制
 
 1. 模型是**平面单摆**（3 广义坐标 → 4 状态），不含 Roll / Yaw 与腿部质量分布的完整耦合。
-2. 固件轮环是「位置 → 速度 → 电流」串级，LQR 的力矩只能经上位机折算成速度/角度指令下发（见 11.4）；若要真正力矩直通，需给 `Wheel_t` 增加 `torque` 字段并在固件里支持直通电流模式。
-3. 关节零位由固件 `joint_calib[]` 维护，上位机只负责“关节坐标系”。
+2. 固件轮环已改为**纯力矩直通**（`wheel[i].torque × WHEEL_COUNTS_PER_NM` → 电流，无位置/速度环），
+   所以上位机承担了轮子全部闭环：Pitch LQR（平衡）+ 速度误差 P（行驶）+ 偏航误差 P（转向）。
+   代价是上位机→USB→固件的延迟直接落在轮子力矩上，控制周期抖动会体现为力矩抖动；
+   力矩标定只依赖固件里的 `WHEEL_COUNTS_PER_NM`（当前 4500 counts/(N·m)）。
+3. 关节零位由固件 `joint_calib[]` 维护，上位机只负责"关节坐标系"。
 4. `gainAt` 有 1e-3 m 的缓存阈值，`quadratic` 模式本身再叠加 5e-4 死区，避免 500 Hz 下反复解 Riccati。
 5. 求解器是连续时间 LQR，没有做离散化。
-6. LQR 只闭环“轮子平衡”，腿的屈伸只改变 `h` 从而改变 `K`；**腿的力矩控制由 VMC 负责**（第 9 章）。
+6. LQR 只闭环"轮子平衡"，腿的屈伸只改变 `h` 从而改变 `K`；**腿的力矩控制由 VMC 负责**（第 9 章）。
 7. 关节超时未实现，若需失力保护应补到通信层；控制层的 `joint_state_timeout` 会让状态机进入 FAULT。
 8. `theta_dot` 目前直接用 IMU 角速度，没有滤波。
 9. 只测过数据链路；实机稳定性需要按第 6 章顺序调参。
 10. `/joint_states` 里轮子的 `position` 单位是 rad；`odom` 的 `x` 单位是 m；不要混用。
-11. `h` 的“实测”依赖关节零位正确，零位偏了 h 就偏，进而 K(h) 错——见 6.5。
+11. `h` 的"实测"依赖关节零位正确，零位偏了 h 就偏，进而 K(h) 错——见 6.5。
 12. `quadratic` 模式的系数只在**模型参数、Q/R 不变**时有效；改了模型或权重后需要重新拟合 `k_coeffs`。
-13. 轮子控制的 LQR 模型**不含腿的 VMC 内力**；两者通过 `/joint_target`（腿）和 `/wheel_target`（轮）分开作用，是“分层”而不是“统一最优”。
-14. 轮子目标 = 平衡量（左右同向）+ 行驶量（左右差速），由 `leg_control` 的分配层统一合成（平衡优先，见 11.4）。**二者共用 `max_wheel_omega` 限幅**，大速度行驶时留给平衡的余量会变小。
-15. **500 Hz 是 ROS2 用户态的“软实时”**：`create_wall_timer` 受执行器调度、CPU 负载影响；真硬实时应下沉到固件。
+13. 轮子控制的 LQR 模型**不含腿的 VMC 内力**；两者通过 `/joint_target`（腿）和
+    `/wheel_torque`（轮，平衡 + 行驶 + 转向的全部力矩）分开作用，是"分层"而不是"统一最优"。
+14. 轮子力矩 = 平衡量（左右同向）+ 速度误差 P（左右同向）± 偏航误差 P（左右反相），由 `leg_control` 的分配层统一合成（见 11.4）。**三者共用 `wheel_torque_max` 限幅**（默认 0.40 N·m ≈ 轮地摩擦上限），大速度行驶时留给平衡的余量会变小。
+15. **500 Hz 是 ROS2 用户态的"软实时"**：`create_wall_timer` 受执行器调度、CPU 负载影响；真硬实时应下沉到固件。
 16. **上层命令来自参数服务**：`command_param_node` 通过 ROS 2 原生参数服务接收 rqt / `ros2 param set` 的修改，不需要独立终端；launch 里的 `use_command_server` 默认 `true`。
-17. `balance_torque_to_omega` 是**人为的力矩→速度折算系数**（默认 1.0 rad/s per N·m），必须按实机标定；速度域分配**不等价于**力矩域分配。
-18. `FAULT` 状态下关节按“失力”处理（上位机只能发纯力矩），腿会塌下来；要保持姿态，需要给 `usb_drive` 配 `joint_kp/joint_kd`。轮子统一按“位置保持”当抱闸。**例外**：姿态越界引起、且还没到倒伏程度的 FAULT 会继续保平衡（见 11.3），这是为了让机器人有机会自己回正。
+17. 轮子执行已改为**固件力矩直通**（`wheel_control_task` 里没有位置/速度环），上位机给的就是力矩：
+    `τ = u + k_vel_p·(v_des − ẋ) ∓ [yaw_ff·ω_des + k_yaw_p·(ω_des − ω)]`，经 `/wheel_torque`
+    → 帧里 `wheel[i].torque`（`wheel_torque_gain` 默认 1.0）→ 固件乘 `WHEEL_COUNTS_PER_NM` 变电流。
+    `/wheel_target`（ω）在实机上已不参与执行，只有仿真桥还把它当力矩用。
+18. `FAULT` 状态下关节按"失力"处理（上位机只能发纯力矩），腿会塌下来；要保持姿态，需要给 `usb_drive` 配 `joint_kp/joint_kd`。轮子在没有位置环之后改为**阻尼制动**（`wheel_brake_damp`，`τ = −k·ω`），不再是"位置保持"抱闸——坡上会有缓慢溜车，需要完全锁死得另做速度环。**例外**：姿态越界引起、且还没到倒伏程度的 FAULT 会继续保平衡（见 11.3），这是为了让机器人有机会自己回正。
 19. `/odom` 是「轮弧长 + IMU yaw」的 2D 里程计：位移只来自轮端（无滤波、打滑会漂移），朝向来自 IMU yaw（陀螺积分会缓慢漂移、磁力计易受干扰）；只用于调试/可视化，不参与平衡。
 20. ~~当前仿真模型是**串联 2R**~~ → 已改：URDF/MJCF 现在都是**双五杆闭链**，与实机关节语义一致（1 个驱动髋 + 1 个被动膝/腿，见 9.5 的历史说明与附录 C）。
 21. MJCF（`src/model/model/wheel_leg.xml`）已经是**双五杆闭链**（两条 `connect`），但：
@@ -854,7 +891,7 @@ sudo udevadm control --reload-rules && sudo udevadm trigger
 | 刚度 | `kp_x` / `kp_y` | 60 / 600 N/m |
 | 阻尼 | `kd_x` / `kd_y` | 3 / 40 N·s/m |
 | 限幅 | `force_max_x` / `force_max_y` | 40 / 150 N |
-| 目标 | `foot_target_x` / `com_height_default` / `com_height_rate` | 0.03 m / 0.0834 m / 0.30 m·s⁻¹ |
+| 目标 | `foot_target_x` / `com_height_default` / `com_height_rate` | **0.0314** m / 0.0834 m / 0.30 m·s⁻¹ |
 | 输出 | `joint_torque_max` / `joint_torque_sign` | 8 N·m / 4×1.0 |
 | 标定 | `joint_sign` / `joint_offset` | [1, 1, -1, -1] / 见 12.7 表（实机已标定） |
 | 接口 | `joint_states_topic` / `joint_target_topic` / `leg_joint_names` | `joint_states` / `joint_target` / 4 个腿关节名 |
@@ -874,7 +911,7 @@ sudo udevadm control --reload-rules && sudo udevadm trigger
 ⑦ 最后再放开 force_max / joint_torque_max
 ```
 
-**别和 LQR 抢**：VMC 管腿（`/joint_target` 的 effort），LQR 管轮（`/wheel_target`）。`kp_x` 太大时腿会把机身前后"锁死"，轮子的平衡动作会被抵消，表现为车不动、腿抖。
+**别和 LQR 抢**：VMC 管腿（`/joint_target` 的 effort），LQR 管轮（`/wheel_torque` 的力矩，实机唯一执行通道；`/wheel_target` 现在只有仿真桥在用）。`kp_x` 太大时腿会把机身前后"锁死"，轮子的平衡动作会被抵消，表现为车不动、腿抖。
 
 ---
 
@@ -922,40 +959,35 @@ sudo udevadm control --reload-rules && sudo udevadm trigger
 | `ω` / `angular.z` | 底盘 yaw 角速度（转向角速度） | rad/s |
 | `v_L` / `v_R` | 左/右轮线速度 | m/s |
 | `ω_L` / `ω_R` | 左/右轮角速度（= 轮速 ÷ r） | rad/s |
-| `L` | 轮距（`wheel_separation`） | m |
 | `r` | 轮半径（`wheel_radius`） | m |
 
-**正解**（轮速 → 底盘，差速运动学；`/odom` 现改为「轮弧长 + IMU yaw」，见第 11 章）：
+**正解**（轮速 → 底盘；`/odom` 用「轮弧长 + IMU yaw」，见第 11 章）：
 
 ```
 v = (ω_L + ω_R)·r / 2
-ω = (ω_R − ω_L)·r / L
 ```
 
-**反解**（底盘 → 轮速，由控制核心的分配层执行）：
+**转向**不走差速运动学，而是**力矩差**：`τ_R − τ_L = 2·τ_yaw`（见 11.4），
+轮距 `L` 已经不需要作为参数下发。
 
-```
-ω_L = (v − L/2·ω) / r
-ω_R = (v + L/2·ω) / r
-```
+符号：`ω > 0` 左转（逆时针、yaw 增大，右轮力矩更大）；`ω < 0` 右转；
+`τ_L = τ_R` 是直线。
 
-符号：`ω > 0` 左转（逆时针、yaw 增大，右轮快左轮慢）；`ω < 0` 右转；
-`v = 0、ω ≠ 0` 是原地转；`ω_L = ω_R` 是直线。
-
-限幅顺序：先把 `v`、`ω` 截到 `max_linear_velocity` / `max_yaw_rate`，再算轮速；
-然后与平衡分量相加，最后整体截到 `max_wheel_omega`（平衡优先，见 11.4）。
+限幅顺序：先把 `v`、`ω` 截到 `max_linear_velocity` / `max_yaw_rate`，再叠加平衡与偏航分量，
+最后整体截到 `wheel_torque_max`（见 11.4）。
 
 ### 10.2 参数速查（`leg_control_params.yaml`）
 
 | 参数 | 默认 | 说明 |
 |---|---|---|
-| `wheel_separation` | 0.305 | L [m]，唯一来源（分配层与 `/odom` 共用）；URDF 两轮轴 y=±0.1525，按轮胎接地中心线约 0.297 |
 | `wheel_radius` | 0.030 | r [m]，唯一来源；STL 轮胎外缘 0.0299 |
 | `max_linear_velocity` / `max_yaw_rate` | 1.0 / 3.0 | 车体线速度 / 角速度限幅 |
-| `max_wheel_omega` | 20.0 | 单轮角速度总限幅 [rad/s] |
-| `max_drive_omega` | 12.0 | 行驶分量限幅 [rad/s] |
+| `wheel_torque_max` | 0.40 | 单轮力矩总限幅 [N·m]（力矩通道） |
+| `k_vel_p` / `k_yaw_p` | 1.0 / 0.15 | 线速度误差 P / 偏航角速度误差 P（力矩通道） |
+| `max_wheel_omega` | 20.0 | 单轮角速度总限幅 [rad/s]（仅速度通道 = 仿真） |
 | `command_timeout` / `command_fault_timeout` | 0.3 / 1.0 s | 命令超时降级 / 长期丢失停机 |
 | `control_rate` | 500 | 控制环频率 [Hz] |
+| `debug_rate` | 100 | 调试输出频率 [Hz]（`/odom` + TF + `/leg_control/state`），0 = 不发 |
 
 均支持 `ros2 param set /leg_control ...`。
 
@@ -987,10 +1019,10 @@ v = (ω_L + ω_R)·r / 2
 
 ### 11.1 原则
 
-1. **实时控制环独立、固定周期**：500 Hz 任务只做“读快照 → 算 → 发”，不等参数服务、不等 USB、不做日志 IO。
+1. **实时控制环独立、固定周期**：500 Hz 任务只做"读快照 → 算 → 发"，不等参数服务、不等 USB、不做日志 IO。
 2. **上层只改目标**：50 Hz 参数服务节点只发布意图（速度、转向、质心高度、模式），不参与任何控制计算。
-3. **通信只搬运**：200 Hz USB 节点把“最近一帧命令”搬到下位机，把状态帧搬上来；包到达时刻不决定控制何时运行。
-4. **三个频率不需要对齐**：一个 20 ms 的参数命令会被 10 个 2 ms 控制周期复用，中间靠“最近有效命令 + 超时门限”衔接。
+3. **通信只搬运**：200 Hz USB 节点把"最近一帧命令"搬到下位机，把状态帧搬上来；包到达时刻不决定控制何时运行。
+4. **三个频率不需要对齐**：一个 20 ms 的参数命令会被 10 个 2 ms 控制周期复用，中间靠"最近有效命令 + 超时门限"衔接。
 5. **参数不在控制环中途改**：参数回调只校验并放进待生效区，下一个周期边界统一切换（`applyConfig`）。
 
 | 模块 | 频率 | 周期 | 代码位置 |
@@ -1014,7 +1046,7 @@ v = (ω_L + ω_R)·r / 2
 ⑤ 统计本周期执行时间与周期抖动
 ```
 
-- **快照一致性**：单线程执行器下，IMU/命令回调和定时器串行，读到的一定是“某一时刻的完整组合”。
+- **快照一致性**：单线程执行器下，IMU/命令回调和定时器串行，读到的一定是"某一时刻的完整组合"。
 - **姿态来源**：`theta = rpy(axis) − theta_offset`，`theta_dot = ω_y`；`theta_axis` 可切 `pitch/roll`。
 - **质心高度目标**：命令里的 `com_height` 按 `com_height_rate` 斜坡逼近（默认 0.30 m/s），避免参数突变就给 VMC 一个阶跃目标。
 - **代码分层**：`types`（数据）→ `core`（控制计算，无 ROS）→ `io`（消息解析与打包）→ `node`（参数、话题、定时器）。
@@ -1041,12 +1073,15 @@ v = (ω_L + ω_R)·r / 2
 
 | 状态 | 轮子 | 关节 | 说明 |
 |---|---|---|---|
-| `INIT` | 位置保持 | 失力 | 上电自检，传感器没就绪就停在这里，不报故障停机 |
-| `IDLE` | 位置保持 | 失力 | 等使能；`startup_cycles` 连续健康后才允许进 RUN |
-| `RUN` | 平衡 + 行驶/转向 | VMC 力矩 | 正常控制 |
-| `DEGRADED` | **速度目标归零**，仍保留平衡 | VMC 力矩 | 上层命令超时（默认 0.3 s） |
-| `FAULT` | 位置保持（当抱闸） | 失力 | IMU/关节超时、姿态越界、急停、命令长期丢失（>1 s） |
-| `FAULT`（姿态类，未倒伏） | **继续平衡 + 位置保持** | **VMC 力矩** | 只有姿态越界、且没到倒伏程度：继续保平衡等它自己回正，见下 |
+| `INIT` | 阻尼制动（`−wheel_brake_damp·ω`） | 失力 | 上电自检，传感器没就绪就停在这里，不报故障停机 |
+| `IDLE` | 阻尼制动 | 失力 | 等使能；`startup_cycles` 连续健康后才允许进 RUN |
+| `RUN` | 平衡 + 行驶 + 转向（力矩） | VMC 力矩 | 正常控制 |
+| `DEGRADED` | **速度/转向目标归零**，仍保留平衡 | VMC 力矩 | 上层命令超时（默认 0.3 s） |
+| `FAULT` | 阻尼制动 | 失力 | IMU/关节超时、姿态越界、急停、命令长期丢失（>1 s） |
+| `FAULT`（姿态类，未倒伏） | **继续平衡** | **VMC 力矩** | 只有姿态越界、且没到倒伏程度：继续保平衡等它自己回正，见下 |
+
+> 力矩直通后没有"位置保持"这种抱闸能力：非平衡态只给 `τ = −wheel_brake_damp·ω` 的阻尼，
+> 坡度上会缓慢溜车。要真正锁死，得在上位机加轮速闭环（用 `joint_states` 的轮速反馈）。
 
 故障位（`/leg_control/state[1]`，按位或）：
 
@@ -1060,12 +1095,12 @@ v = (ω_L + ω_R)·r / 2
 
 五条容易踩的规则：
 
-- **故障不是一律“零力矩”**：轮子直接撤掉平衡力矩可能让车直接倒；所以 FAULT 里轮子改成“位置保持”（等价抱闸），关节才失力。
+- **故障不是一律"零力矩"**：轮子直接撤掉平衡力矩可能让车直接倒；所以 FAULT 里轮子改成"阻尼制动"（`τ = −wheel_brake_damp·ω`，见 11.4），关节才失力。
 - **姿态类故障（`0x08`）是可自动恢复的**（2026-10-30 改）：因为 FAULT 里关节一失力，机器人 0.1 s 内
   就会真的倒下去，根本没有恢复窗口。现在只要**还没到倒伏**，FAULT 期间仍照常输出平衡 / VMC 力矩，
   姿态回到门限 **75%** 以内、且角度和角速度都收敛、连续 5 个周期（10 ms）→ 自动回 `RUN`。
   实测一次 `0x08` 到 `RUN` 约 20 ms。
-- **其它硬故障仍然锁存**：撤 `enable` 再重新使能才能回 `IDLE`（防止机器人“自己站起来”）。
+- **其它硬故障仍然锁存**：撤 `enable` 再重新使能才能回 `IDLE`（防止机器人"自己站起来"）。
 - **倒伏判据**：`|pitch| > 2.5 × max_pitch`（0.35 → 0.875 rad ≈ 50°）或
   `|pitch_rate| > 3 × max_pitch_rate`（3.0 → 9 rad/s）时认定已经救不回来，才真正失力。
   两个倍数在 `control_state.hpp` 的 `kFallPitchFraction / kFallRateFraction` 里，没有做成 ROS 参数。
@@ -1073,25 +1108,42 @@ v = (ω_L + ω_R)·r / 2
 
 ### 11.4 轮子控制与分配规则
 
+**实机主链路是力矩域**（固件 `wheel_control_task` 已删除位置/速度环，只做 `N·m → 电流`）：
+
 ```
-u            = −K(x − x_ref)                         ① Pitch LQR，单位 N·m
-ω_balance    = clamp(u · balance_torque_to_omega)    ② 力矩 → 速度域折算（实机标定）
-v_L, v_R     = v_d ∓ L/2·ω_d                         ③ 差速运动学
-ω_drive      = clamp((v_L, v_R) / r)                 ④ 行驶分量限幅
-ω_ref        = clamp(ω_balance + ω_drive, ±max_wheel_omega)   ⑤ 平衡优先，整体限幅
+u        = −K(x − x_ref)                                    ① Pitch LQR，单位 N·m，限幅 ±u_max
+τ_v      = k_vel_p·(v_d − ẋ) [+ k_vel_i·∫ …]                ② 速度误差 P(+I)，左右同相
+τ_yaw    = yaw_ff·ω_d + k_yaw_p·(ω_d − ω) [+ k_yaw_i·∫ …]   ③ 偏航误差 P(+I) + 角速度前馈
+τ_L      = clamp(u + τ_v − τ_yaw, ±wheel_torque_max)        ④ 左轮
+τ_R      = clamp(u + τ_v + τ_yaw, ±wheel_torque_max)        ⑤ 右轮
+→ /wheel_torque → 帧 wheel[i].torque → 固件 τ × WHEEL_COUNTS_PER_NM → 0x200 电流
 ```
 
-为什么停在“速度域”：下位机 M2006 用的是 **位置 → 速度 → 电流** 串级 PID（`wheel_control_task`），
-USB 帧里的 `Wheel_t` 只有 `{angle, omega}`，**没有力矩字段**，所以上位机没法直接给轮子力矩。
-LQR 的 `u` 只能经 `balance_torque_to_omega` 折算成速度目标，再由固件速度环跟踪。
-要真正在力矩域分配，需要给协议加 `torque` 字段并让固件支持直通电流模式。
+- **转向 = 两轮力矩差**：`τ_R − τ_L = 2·τ_yaw`，不再需要差速速度前馈。差速运动学
+  （`v ∓ L/2·ω` 再除 `r`）只作为 `/wheel_target` 的诊断量保留。
+- **符号**：正偏航 = 左转 → 右轮 `+τ_yaw`、左轮 `−τ_yaw`（两轮在世界系里同向）。
+  `yaw_ff` 是前馈、`k_yaw_p` 是反馈；`k_yaw`（旧的速度通道反馈）实测会放大横向擦地扰动，保持 0。
+- **非平衡态**（未使能 / FAULT / 命令长期丢失）：`τ_L = τ_R = −wheel_brake_damp·ω`，阻尼制动。
+  `usb_drive` 侧还有一层兜底：状态帧超时（`state_timeout`）时按 `τ = −safe_damp_torque·ω` 发安全帧。
+  两者都不是"位置保持"，坡上会有缓慢溜车。
+- **限幅链**：`u_max`（平衡分量）→ `wheel_torque_max`（单轮总力矩，默认 0.40 ≈ 轮地摩擦上上限）
+  → `usb_drive` 的 `max_wheel_torque` 与固件的 `WHEEL_CUR_MAX_CMD`。速度通道的
+  `max_balance_omega / max_wheel_omega` 只在 `/wheel_target` 上有意义。
 
-限幅优先级：`u_max`（单轮平衡力矩）→ `max_balance_omega`（平衡分量）→ `max_drive_omega`（行驶分量）→ `max_wheel_omega`（总和）。
+**速度通道 `/wheel_target` 现在只有仿真桥在用**：`sim_bridge` 把 `/wheel_target` 直接当力矩
+（`balance_torque_to_omega=1.0`、`wheel_damp_ff`、`yaw_ff` 一起合成），所以 12.13 那套
+仿真调参经验仍然有效；但**实机不要照抄 `balance_torque_to_omega`**，它只影响这条诊断通道。
+实机的行驶由 `k_vel_p` 出力矩（`v/r` 这个"速度"在实机没有执行器）。
+
+`k_vel_i` / `k_yaw_i` 默认 0：积分在"静摩擦→滑动"切换时会 windup（12.13 两次试验都超速/摔倒），
+需要消除稳态差时小步加，限幅是 ±0.5·`wheel_torque_max`。
+
+停车后 LQR 的 `ref_x` 仍**原地冻结**（不往原点拉，否则停下瞬间 x 误差会顶到 ±u_max 猛刹）。
 
 ### 11.5 实时性怎么验证
 
 `/leg_control/timing` 每秒发 5 个数：周期均值、周期最大、执行均值、执行最大（ms）、超期次数
-（“超期”= 周期 > 1.5 倍名义周期）。执行最大超过 2 ms 时节点会打 WARN。
+（"超期"= 周期 > 1.5 倍名义周期）。执行最大超过 2 ms 时节点会打 WARN。
 
 ```bash
 ros2 topic echo /leg_control/timing
@@ -1100,10 +1152,10 @@ ros2 topic echo /leg_control/timing
 
 要点：
 
-- **不能只在循环末尾 delay 2 ms 就算 500 Hz**：要看“周期分布 + 最大执行时间 + 超期计数”。
+- **不能只在循环末尾 delay 2 ms 就算 500 Hz**：要看"周期分布 + 最大执行时间 + 超期计数"。
 - `rclcpp` 的 `create_wall_timer` 运行在 ROS 执行器里，IMU 200 Hz、命令 50 Hz 的回调会和控制周期共享线程；
   实机上如果执行最大时间接近周期，先把 IMU 频率降到 200 Hz、把日志/参数回调移出控制线程。
-- 平均周期稳定但“最大值”偶尔超过 2 ms，通常是节点启动首帧（首次 Riccati 求解 / 首次内存分配），属正常。
+- 平均周期稳定但"最大值"偶尔超过 2 ms，通常是节点启动首帧（首次 Riccati 求解 / 首次内存分配），属正常。
 
 ### 11.6 与下位机（`stm32/one`）的分工
 
@@ -1111,16 +1163,16 @@ ros2 topic echo /leg_control/timing
 |---|---|---|---|
 | 上层命令 | 上位机 50 Hz | 把 rqt / ros2 param 参数变成目标（速度、转向、质心高度、使能、急停） | `command_param_node` |
 | 状态估计 | 上位机 500 Hz | 关节角 → h；IMU 四元数 → θ 与 yaw；轮弧长 + yaw → 2D 里程计 | `leg_control_node` |
-| 平衡 / VMC / 分配 | 上位机 500 Hz | LQR、双腿 VMC、轮子速度域分配 | `leg_control_core` |
-| 通信 | 上位机 200 Hz | 96 B 目标帧下行 / 208 B 状态帧上行、链路看门狗 | `usb_drive_node` |
-| 电机环 | STM32 333 Hz | M2006 位置-速度串级 PID、RobStride 运控帧、CAN 收发 | `wheel_control_task` / `joint_control_task` |
+| 平衡 / VMC / 分配 | 上位机 500 Hz | LQR、双腿 VMC、轮子力矩分配（平衡 + 速度误差 P ± 偏航误差 P） | `leg_control_core` |
+| 通信 | 上位机 200 Hz | 104 B 目标帧下行 / 208 B 状态帧上行、链路看门狗、安全帧 | `usb_drive_node` |
+| 电机环 | STM32 333 Hz | M2006 **纯力矩直通**（N·m → 电流，无位置/速度环）、RobStride 运控帧、CAN 收发 | `wheel_control_task` / `joint_control_task` |
 | 状态上报 | STM32 100 Hz | 打包 `RobotState_t` 并经 USB 发出 | `state_send_task` |
 
 关键约束：
 
 - 固件按**结构体裸内存**收发，`data_pack.h` 与 `task.h` 必须逐字节一致（编译期 `static_assert` 会先拦）。
 - 固件的关节坐标是**电机坐标系**，零位/方向由 `joint_calib[]` 处理；上位机看到的已经是关节坐标系。
-- 固件**没有命令超时**：USB 断开后它会继续执行最后一帧。上位机的兜底是“状态帧超时 → 发安全帧”，
+- 固件**没有命令超时**：USB 断开后它会继续执行最后一帧。上位机的兜底是"状态帧超时 → 发安全帧"，
   但这依赖 USB 仍然通；真正的断线安全应在固件里补 `target_age` 看门狗。
 - 固件 4 个任务优先级都是 1，靠 `vTaskDelayUntil` 定节拍；如果后面要在固件里加 500 Hz 控制环，
   建议合并成一个控制任务顺序执行，而不是给每个控制器各开一个任务。
@@ -1130,7 +1182,10 @@ ros2 topic echo /leg_control/timing
 1. **驱动与标定**：六个电机的正方向、编码器单位、IMU 姿态定义、力矩单位、CAN 限幅。
 2. **单腿 VMC**：撑住车身，先核对 `α=β=90°` 的足端位置，再放开 Kp/Kd（第 9 章）。
 3. **Pitch LQR**：先用单元测试和模型仿真验证，再实机加保护支架（第 6 章）。
-4. **轮子速度与转向**：确认 `balance_torque_to_omega` 的符号与量级，避免“越平衡越倒”。
+4. **轮子力矩与转向**（固件已是力矩直通）：架空，先 `ros2 topic pub -1 /wheel_torque ... "{data: [0.05, 0.05]}"`，
+   确认两轮同向同速、`odom.x` 同向；再给 `[0.05, -0.05]` 确认转向方向与 `yaw_rate` 正方向一致。
+   力矩符号反了会"越平衡越倒"，先查 `left/right_invert`，再查固件 `dir[2]`（两处只能改一处）。
+   闭环前确认 `wheel_torque_gain=1.0`、`k_vel_p/k_yaw_p` 从 1.0/0.15 起。
 5. **分层合环**：`wheel_leg_control.launch.py` 全开，观察 `/leg_control/state` 的 `state` 与 `faults`。
 6. **安全测试**：拔 USB、断电、越界推倒、触发 `estop`，确认状态机进入 `DEGRADED` / `FAULT` 且机器人不会突然跌落。
 7. **实时性回归**：记录 `/leg_control/timing` 的周期最大、执行最大、超期次数，作为每次改动的基线。
@@ -1199,7 +1254,7 @@ update_start_gate();
 `sim_bridge` 订阅门控的 latched 话题 `/mujoco/start_gate_open`，`wheel_arm_on_gate: true` 时只有门控
 真正放开的那个周期才开始把 `/wheel_target` 当作轮子力矩下发。以前用固定延时 `wheel_start_delay=1.45 s`，
 而门控放开时刻在 **1.12～1.60 s** 之间浮动（取决于 spawner 何时把三个控制器激活完），就会出现
-“挂架还夹着、轮子已经转起来”。实测启动瞬态 x 一度冲到 **0.44 m**；改成跟门控同步后只有
+"挂架还夹着、轮子已经转起来"。实测启动瞬态 x 一度冲到 **0.44 m**；改成跟门控同步后只有
 x∈[−0.007, 0.055]、θ∈[−0.017, 0.003]，而且 `u` 全程不饱和。
 
 #### 关键坑：就绪判定不能在仿真线程里做
@@ -1298,25 +1353,29 @@ qpos=0 闭环残差 = 3.812e-07 m      # 必须 ~1e-7；> 1e-4 说明 site 放�
 | `l1 + l2`（最大伸展） | 0.1550 m |
 | 两髋间距 `l5` | 0.0600 m |
 | **可达 `foot_y` 上限**（零重力摆动 16 s 实测） | **0.1483 m**（= 0.96 × (l1+l2)） |
-| home 姿态的 `foot_y`（轮轴 z 0.0321 − 髋 z 0.1493） | 0.1172 m（79% 行程，很舒服） |
-| 曾经的 `com_height_default=0.18` 对应 `foot_y = 0.18 + 0.0338` | **0.214 m → 144% 上限** |
+| home 姿态的 `foot_y`（新零位：髋 z 0.09514 − 轮轴 z 0.03390） | **0.0612 m**（深蹲，2026-11-01 改零位后） |
+| 新零位工作空间（`foot_x≈0.031` 扫 α/β ∈ ±2 rad） | `foot_y ∈ [0.046, 0.152]`，`h ∈ [0.017, 0.123]` |
+| 曾经的 `com_height_default=0.18` 对应 `foot_y = 0.18 + 0.0289` | **0.214 m → 超出上限** |
 
 也就是说 VMC 在命令腿伸到**比机构最大伸展还长**的位置，腿只能顶到 `[-2, 2]` 限位，
 表现为"腿贴着限位、机器人慢慢滑走"。现在 `com_height_default` 与 `command_param.com_height`
-都取 **0.0834**（换算 `foot_y = 0.0834 + 0.0338 = 0.1172`，正好等于 home 姿态）：
+都取 **0.0834**（换算 `foot_y = 0.0834 + 0.0289 = 0.1123`，比深蹲 home 撑开 5 cm，仍在 74% 行程）：
 
 ```yaml
 leg_control:
   ros__parameters:
-    com_offset: -0.0338        # home 姿态摆杆质心在髋轴下方 33.8 mm（URDF）
-    com_height_default: 0.0834 # foot_y = 0.1172 m，与 home 姿态一致
+    com_offset: -0.0289        # 新零位摆杆质心在髋轴下方 28.9 mm
+    com_height_default: 0.0834 # foot_y = 0.1123 m（home 深蹲 0.0612，靠这里把腿撑开）
 command_param:
   ros__parameters:
     com_height: 0.0834
 ```
 
-自查方法：`foot_y = com_height − com_offset` 应远离伸直奇异位形（`com_height_max=0.100` → `foot_y=0.1338`，
-是上限的 90%，节点启动时会用 11 个采样高度校验 `脚端距离 < 0.9·(l1+l2)`）；
+> 冷启动时机器人从深蹲（h≈0.034）伸到 h≈0.069；伸腿发生在启动门控阶段，
+> 放开时已经到位，实测放开瞬间 `h` 就是 0.069、`θ` 无冲击。
+
+自查方法：`foot_y = com_height − com_offset` 应远离伸直奇异位形（`com_height_max=0.100` → `foot_y=0.1289`，
+是上限的 85%，节点启动时会用 11 个采样高度校验 `脚端距离 < 0.9·(l1+l2)`）；
 `com_offset` 按 home 姿态下排除两轮的摆杆质心计算，改变腿姿后仍需复核该近似。
 
 ### 12.5 被动关节必须给 `armature` 和阻尼
@@ -1390,19 +1449,22 @@ armature 3e-3 → 3.3 kg     （leg_control 里 cart_mass 才 0.285 kg，直接�
 （x 从 O 指向 D、y 向下）的方向角 `atan2(dy, dx)`，q=0 与 q=±0.4 线性拟合（斜率恰为 ±1，残差 1e-3 度），
 **斜率 = `joint_sign`、截距 = `joint_offset`**。同一套数也可以直接从 URDF 关节 origin 算出来：
 
-| 关节 | 髋→肘（五杆平面） | 零位角 = `joint_offset` | `joint_sign` |
+| 关节 | 髋→肘（五杆平面，2026-11-01 新零位） | 零位角 = `joint_offset` | `joint_sign` |
 |---|---|---|---|
-| `lf_joint1` → α_L | (−0.0275573, +0.0417204) | **+123.446°** = 2.154534 rad | +1 |
-| `lb_joint1` → β_L | (+0.0412990, +0.0281850) | **+34.312°** = 0.598858 rad | +1 |
-| `rf_joint1` → α_R | (−0.0249005, +0.0433586) | **+119.868°** = 2.092103 rad | −1 |
-| `rb_joint1` → β_R | (+0.0282360, +0.0412640) | **+55.617°** = 0.970701 rad | −1 |
+| `lf_joint1` → α_L | (−0.04972, −0.00565) | **−173.44°** = **−3.0285 rad** | +1 |
+| `lb_joint1` → β_L | (+0.04909, −0.00950) | **−10.95°** = **−0.1911 rad** | +1 |
+| `rf_joint1` → α_R | (−0.04974, −0.00502) | **−174.24°** = **−3.0411 rad** | −1 |
+| `rb_joint1` → β_R | (+0.04959, −0.00645) | **−7.41°** = **−0.1293 rad** | −1 |
+
+> 2026-11-01 换了关节零位（`lf1 rpy -1.1 / lb1 +0.79 / rf1 -1.15 / rb1 +1.1`），上表的截距全部重标定，
+> `joint_sign` 不变。旧零位那组是 `[2.155471, 0.598858, 2.092103, 0.970701]`（对应 123.5°/34.31°/119.87°/55.62°），
+> 只在读旧日志/旧 yaml 时才对得上。测量脚本：`/tmp/geom`（MuJoCo FK + q±0.01 扰动，直接打印 α/β 与斜率）。
 
 即 `α/β = joint_sign·q + joint_offset`（`leg_control_params.yaml` 里同名参数，见 `leg_control_core`
 的 `legJointAngles()`；`τ_q = joint_sign·τ_α`）。右腿取 −1 就是因为上面那条「整体绕 x 轴转 180°」。
 
-> 精度说明：β_L / α_R / β_R 三个数与 URDF 复算逐位一致；α_L 的 yaml 现值是 2.155471（=123.499°），
-> URDF 精确值是 **2.154534（=123.446°）**，差 0.054°（5 cm 曲柄上 0.05 mm 足端位移）。
-> 想完全对齐就把 `joint_offset[0]` 改成 2.154534，不改也满足 < 1 mm 的验收线。
+> 精度说明：四个截距都是直接从 MJCF 的 FK 量的（q=0 与 q±0.01 拟合，斜率恰好 ±1.0000），
+> 与 URDF 口径一致；用控制器 FK 复算的足端与 MJCF 差 < 0.3 mm，满足 < 1 mm 的验收线。
 
 同一批测量同时确认**杆长标称值全部正确**（base 系平面投影，q=0 与 ±0.4 都不变）：
 
@@ -1511,15 +1573,18 @@ for (int s = 0; s < 2000; s++) mj_step(m, d);
 | 3 | 1/6 后饱和 0%，x∈[0.020,0.030]、θ≈−0.006、z=0.106 | 稳态达标 |
 | 4 | 但启动瞬态 x 一度 0.44 m | 门控放开时刻在 1.12～1.60 s 浮动、轮子按固定延时先转 → `wheel_arm_on_gate: true`（12.2） |
 | 5 | 推一下报 `FAULT 0x08` 后关节失力，0.1 s 内直接倒 | 姿态类 FAULT 期间继续保平衡 + 自动回 `RUN`（11.3） |
+| 6 | `enable` 后电机没反应：状态卡在 `INIT`、故障位每秒 `0x22↔0x00` 抖 | 同 domain 别的机器人往 `/joint_states` 发数据 → `SnapshotIO` 整条忽略不含本机关节的消息（io 层修复） |
+| 7 | 发 `/cmd_vel` 机器人冲出去 | 仿真把 `/wheel_target` 当力矩：速度指令先经 `max_linear_accel` 斜坡，命令 0.1 m/s 起试（11.4） |
 
 最终一组（已在 `leg_control_params.yaml` 里）：
 
 | 参数 | 值 |
 |---|---|
-| `gain_mode` / `k_coeffs` | quadratic / 常数项 `[−1.18, −4.52, −1.16, −0.28]`（LQR 的 1/6） |
+| `gain_mode` / `k_coeffs` | quadratic / 常数项 `[−1.18, −4.52, −2.00, −0.28]`（LQR 的 1/6，`k_x_dot` 由 −1.16 提到 −2.00，见 12.13） |
 | `u_max` / `balance_leak_rate` | 0.40 N·m / 60 s⁻¹ |
 | `max_pitch` / `max_pitch_rate` | 0.35 rad（20°）/ 3.0 rad/s |
 | 轮子使能时刻 | `wheel_arm_on_gate: true` |
+| 行驶 | 速度斜坡 `max_linear_accel: 0.30`、`max_yaw_accel: 1.0`；`cmd_vel_timeout: 0.5` |
 
 验证数据：
 
@@ -1533,6 +1598,165 @@ for (int s = 0; s < 2000; s++) mj_step(m, d);
 一个容易困惑的数：站稳时 `/leg_control/state[8]` 的 `h` 是 **0.069 m** 而不是 0.0834 m。
 这是 VMC 的静态压缩：`kp_y=600 N/m`、单腿承重约 9.5 N → 压 16 mm，`foot_y` 从 0.1172 落到约 0.101，
 再减 `com_offset` 就是 0.069。属于预期行为；`quadratic` 模式下增益与 `h` 无关，不影响控制。
+
+### 12.12 腿长 / 线速度 / 偏航角速度 扫点（2026-10-30）
+
+25 个工况，全部在隔离 domain 下冷启动、`enable:=true`，每个工况 6~8 s。判据：
+`run` = `RUN` 占比、`max|th|` = 俯仰峰值、`xend` = 结束位移。
+
+**① 不同腿长（`command_param.com_height`）**
+
+| 指令 h | 实测 h（VMC 压缩后） | run | max\|θ\| | x 漂移 | u |
+|---|---|---|---|---|---|
+| 0.065 | 0.051 | 100% | 0.012 | 0.02 m | 0.01 |
+| 0.075 | 0.061 | 100% | 0.011 | 0.02 m | 0.01 |
+| 0.0834 | 0.069 | 100% | 0.009 | 0.01 m | 0.01 |
+| 0.090 | 0.076 | 100% | 0.008 | 0.01 m | 0.01 |
+| 0.100 | 0.086 | 100% | 0.007 | 0.01 m | 0.01 |
+
+结论：**全行程 0.065~0.100 m 都能稳稳站住**，越低越"软"（俯仰略大），越高俯仰越小。
+注意 h 指令≠实测：VMC `kp_y=600` 撑 9.5 N/腿会压掉约 14 mm，所以 0.0834 指令对应 0.069 实测。
+
+**② 不同线速度（`/cmd_vel` 或 `linear_velocity`，往 −x 跑，避开 5 m 处的台阶）**
+
+| 指令 v | 实测稳态 v | 跟踪比 | run | max\|θ\| | max\|θ̇\| |
+|---|---|---|---|---|---|
+| −0.10 | −0.078 | 78% | 100% | 0.014 | 0.18 |
+| −0.20 | −0.211 | 106% | 100% | 0.026 | 0.30 |
+| −0.30 | −0.343 | 114% | 100% | 0.039 | 0.28 |
+| −0.40 | −0.477 | 119% | 100% | 0.050 | 0.05 |
+
+结论：**0.1~0.4 m/s 全程无故障、俯仰 ≤0.05 rad**；0.2 附近跟踪最好，越快越轻微超速（阻尼前馈是线性近似）。
+
+**③ 不同偏航角速度（`/cmd_vel` 的 `angular.z`）**
+
+| 指令 ω | 实测 ω | run | max\|θ\| | u |
+|---|---|---|---|---|
+| 0.05 | 0.027 | 100% | 0.033 | 0.11 |
+| 0.10 | 0.046 | 100% | 0.009 | 0.01 |
+| 0.20 | 0.089 | 100% | 0.008 | 0.00 |
+
+结论：**原地偏航能稳到 0.2 rad/s 指令（实际约 0.09 rad/s）**，俯仰几乎不动。
+再大（`yaw_ff≥0.08` 或指令 ≥0.3）横向擦地摩擦会"脱粘"失控 → 直接摔倒；
+偏航角速度 P 反馈（`k_yaw`）也不行，>0.01 就把摩擦扰动放大成俯仰。**原地偏航在这套模型里上限约 0.1 rad/s。**
+
+复现脚本：`/tmp/sweep.py`（`height` / `vel` / `yaw` / `final` 四个 stage，自动起停仿真并打印上表）。
+
+### 12.13 换零位后的二次调参（2026-11-01）
+
+URDF/MJCF 的髋/膝零位改掉以后（12.7），几何、质心、惯量全部重标定，控制环的
+`k_coeffs` 与轮子补偿也要重调。判据同上：全部在隔离 domain 冷启动、`enable:=true`。
+
+**① `k_x_dot` 的稳定上限（先算再试）**
+
+`k_coeffs` 的常数项是 LQR 的 1/6 缩放值，改 `k_x_dot` 时要先看闭环极点：
+用线性化模型（附录 A）对 `h∈[h_min,h_max]=[0.06,0.12]` 扫一遍 `A − B·K`：
+
+| `k_x_dot` | max Re(极点) | 结论 |
+|---|---|---|
+| 1.16（旧） | ≈0 | 稳定（贴 0 的积分极点） |
+| 2.00 | ≈0（复极点实部 −4.47） | 稳定，可用 |
+| 2.10 | ≈0（复极点实部 −0.67） | 勉强稳定 |
+| 2.12 | +0.087 | **不稳定** |
+| 2.20 | +3.12 | 不稳定 |
+
+节点启动时会自己做这个检查（`leg_control_node.cpp` 的 `probe` 循环），
+**不满足就直接抛 `实际 LQR 增益未稳定整个四状态模型`**（`k_x_dot=3.0` 就是这样起不来的）。
+所以 2.0 是这套参数下的实际上限。
+
+**② 线速度跟踪（往 −x 跑，避开 5 m 台阶，每档 10 s）**
+
+| 指令 v | 实测稳态 v | 跟踪比 | run | max\|θ\| | max\|θ̇\| |
+|---|---|---|---|---|---|
+| −0.10 | −0.072 | 72% | 100% | 0.033 | 0.41 |
+| −0.20 | −0.187 | 94% | 100% | 0.039 | 0.11 |
+| −0.30 | −0.304 | 101% | 100% | 0.040 | 0.11 |
+| −0.40 | −0.420 | 105% | 100% | 0.040 | 0.11 |
+| −0.50 | −0.538 | 108% | 100% | 0.064 | 0.37 |
+
+对比旧 `k_x_dot=1.16`：−0.10 是 0%~74%、−0.20 是 74%、−0.40 是 104%。
+加法很简单：**`k_x_dot` 决定"每 1 m/s 误差给多少 N·m"**，1.16 时低速指令产生的力矩顶不动静摩擦，
+所以 0.1 m/s 出现死区；2.0 之后死区基本消失，剩余 ~30% 的误差来自轮子阻尼前馈的线性近似。
+
+**③ 积分微调两次失败（`k_vel_i` / `k_yaw_i` 最终置 0）**
+
+| 试验 | 结果 |
+|---|---|
+| `k_vel_i=2.0`（限幅 ±0.15） | −0.1 指令跑成 −0.335，−0.4 直接摔倒，θ̇ 39.5 |
+| `k_vel_i=1.0`（限幅 ±0.05） | −0.10→−0.157、−0.20→−0.353、−0.30→−0.414、−0.40→−0.581，全超速 |
+| `k_yaw_i` 同类 | 原地偏航的静摩擦切换更剧烈，同样 windup |
+
+根因是**静摩擦→滑动的切换**：积分在"推不动"的阶段一直累积，一旦脱粘就以几倍力矩冲出去。
+代码里的两个积分通道保留（`k_vel_i` / `k_yaw_i` >0 才启用，走力矩通道），默认 0 即关闭。
+
+**④ 原地偏航（受限幅 + 前馈标定）**
+
+| 指令 ω | 实测 ω | run | max\|θ\| |
+|---|---|---|---|
+| ±0.05 | ±0.010～0.023 | 100% | 0.034 |
+| ±0.10 | ±0.039 | 100% | 0.014 |
+| ±0.20 | ±0.091 | 100% | 0.014（负向瞬态 0.212） |
+| ±0.30 | ±0.09（饱和） | 100% | 0.065 |
+
+- `yaw_ff=0.07`：0.20 指令能到 0.110 rad/s，但俯仰被擦滑激到 0.41 rad、0.30 直接倒地 → 回退 0.06；
+- 因此仿真 launch 把 `max_yaw_rate` 覆盖成 **0.20**（实机 yaml 仍是 3.0）：
+  超范围的 `angular.z` 只会被截断到 0.2 等效力矩，**不会脱粘摔倒**（0.30 实测 yaw 0.09、0 故障）。
+- 结论不变：**这套模型原地偏航的物理上限约 0.1 rad/s，跟踪比 45%~50%**，靠加大前馈无法突破。
+
+**⑤ 腿长全行程复测（新零位）**
+
+| 指令 h | 实测 h | run | max\|θ\| |
+|---|---|---|---|
+| 0.065 | 0.051 | 100% | 0.018 |
+| 0.070 | 0.056 | 100% | 0.017 |
+| 0.0834 | 0.069 | 100% | 0.014 |
+| 0.100 | 0.086 | 100% | 0.013 |
+
+全部 0 故障、`max|θ̇|≈0`，与旧零位一致。
+
+### 12.14 1 m/s 以上摔倒的真正原因：仿真桥的 `wheel_tau_max` 截断了轮子力矩
+
+**症状**：`/cmd_vel` 给到 0.7 m/s 以上，跑 1~3 s 后俯仰开始下沉（θ 从 −0.02 一路到 −0.3），
+然后 `FAULT 0x08`、关节失力，MuJoCo 里的机身被弹飞（`/imu_site_pose_sensor/pose` 的 x 直接跳到几百米）。
+看起来像摩擦不够、LQR 饱和或积分步长不稳，实际都不是。
+
+**排查**（`/leg_control/state` 的原始数组 + `/imu_site_pose_sensor/pose`，见 12.9 的工具思路）：
+
+1. 维持速度需要的轮子力矩 ≈ `轮关节 damping × ω`。MJCF 里 damping=0.02，1 m/s 时 ω=33 rad/s → **0.66 N·m**；
+2. 控制器给的是 `u（≤0.4）+ wheel_damp_ff·v_d/r（0.016×33=0.53）` ≈ **0.9 N·m**；
+3. 但 `sim_bridge` 有一层限幅：`wheel_tau_max: 0.5`（原意是防止 torque 模式把"轮速数值"当力矩下发给飞），
+   **超过 0.5 的部分被直接切掉**。被切掉的恰好是阻尼前馈，轮子实际得到的力矩不够 →
+   轮速掉、速度误差变大 → LQR 继续加力矩 → 又被截断，最后俯仰环失去配平能力。
+
+**逐项排除**（全部在平地上、500 Hz、`show_gui:=false`）：
+
+| 改动 | 0.75 m/s | 1.0 m/s |
+|---|---|---|
+| 地面/轮胎摩擦 1.2 → 2.5 | 仍摔 | 仍摔 |
+| 物理步进 500 Hz → 2 kHz | 仍摔 | 仍摔 |
+| 轮关节 damping 0.02 → 0.012 | 更早摔 | 更早摔 |
+| 轮关节 damping 0.02 → 0.006 | 不摔但 RUN/FAULT 反复抖、超速到 1.5 | 同左 |
+| `wheel_tau_max` 0.5 → **1.2**（模型不改） | **稳** | **稳** |
+
+**结论**：这是仿真桥的限幅，不是控制器/摩擦/步长问题。改成 `wheel_tau_max: 1.2` 后：
+
+| 指令 v | 实测 v（稳态） | 跟踪比 | run | max\|θ\| | max\|θ̇\| |
+|---|---|---|---|---|---|
+| −0.40 | −0.420 | 105% | 100% | 0.062 | 0.42 |
+| −0.60 | −0.654 | 109% | 100% | 0.054 | 0.11 |
+| −0.80 | −0.883 | 110% | 100% | 0.053 | 0.11 |
+| −1.00 | −1.115 | 112% | 100% | 0.054 | 0.11 |
+| +0.50 | +0.579 | 116% | 100% | 0.041 | 0.13 |
+
+1.0 m/s 稳态大约需要 0.71 N·m（`u=-0.17` + `damp_ff=-0.53`），离 1.2 还有余量；
+速度略超（5~12%）是 `k_x_dot` 比例跟踪的固有偏差，想要更准只能加积分（12.13 ③ 已证明会 windup）。
+
+**倾角容忍度也跟着变好**：用 `/leg_control theta_offset` 做 0.10 s 的阶跃等效扰动，
+0.10 / 0.15 / 0.20 rad 都在 1 s 内回正、全程 `RUN`、0 故障（物理俯仰峰值 0.14 / 0.19 / 0.26 rad）；
+0.25 rad 起才会倒（阶跃比真实推搡更陡，而且上一档的残余运动还没停）。
+之前"倾角大一点就摔"里有一部分也是这层 0.5 限幅：斜着走时 `u + damp_ff` 一起被截断，回正力矩不够。
+
+
 
 ---
 
@@ -1567,30 +1791,47 @@ A = ⎡ 0        0          1  0 ⎤        B = D₀⁻¹·Bq
 ## 附录 B：下位机协议
 
 ```c
-// 上位机 -> 下位机（96 B）
+// 上位机 -> 下位机（104 B）
 typedef struct {
-    Wheel_t wheel[2];        // {angle, omega}         16 B
-    JointTarget_t joint[4];  // {torque, angle, omega, kp, kd}  80 B
+    WheelTarget_t wheel[2];  // {angle, omega, torque}          12 B/轮，共 24 B
+    JointTarget_t joint[4];  // {torque, angle, omega, kp, kd}   20 B/关节，共 80 B
 } RobotTarget_t;
 
 // 下位机 -> 上位机（208 B，10 ms 周期）
 typedef struct {
-    Wheel_t wheel[2];        //                         16 B
+    Wheel_t wheel[2];        // {angle, omega}                  8 B/轮，共 16 B
     JointState_t joint[4];   // 7×float + uint64 error + uint8 feedback  48 B each
 } RobotState_t;
 ```
 
-无包头/类型/使能字段，**长度即帧**；上位机用 `FrameAssembler` 按 208 B 切分。
+无包头/类型/使能字段，**长度即帧**；上位机用 `FrameAssembler` 按 208 B 切分，
+`RobotTarget_t` 的 104 B 由 `data_pack.h` 里的 `static_assert` 卡死。
+
+**轮子通道的 3 个字段**（固件已是**纯力矩直通**）
+
+| 字段 | 含义 | 固件怎么用 |
+|---|---|---|
+| `torque` [N·m] | **力矩指令**（`/wheel_torque`，`wheel_torque_gain=1.0`） | 乘 `WHEEL_COUNTS_PER_NM` → 电流指令，再乘 `dir` 后发 0x200 |
+| `angle` [rad] | 位置目标（`/wheel_target` 的 ω 积分得到） | **保留字段，固件不再使用** |
+| `omega` [rad/s] | 速度目标（`/wheel_target`） | **保留字段，固件不再使用** |
+
+> 轮子的平衡、行驶、转向全部由上位机算成 `[τ_L, τ_R]`（平衡 + 速度误差 P ± 偏航误差 P，见 11.4）。
+> `angle`/`omega` 留着是为了协议兼容与仿真桥（`sim_bridge` 仍把 `/wheel_target` 当力矩用）。
 
 **固件侧行为（`stm32/one/task/task.c`）**
 
 | 项 | 现状 |
 |---|---|
-| `RobotTarget_t` 接收 | `usb_trans.c` 收到短包即视为一帧完成，`usb_target_received()` 直接 `memcpy(&rob_target, ...)`，要求整帧一次到齐（96 B） |
-| 轮子执行 | `wheel_control_task`：`angle` 进位置环 → 输出作为速度环目标 → 电流 int16 打包成 0x200 帧（0x201/0x202 反馈） |
-| 关节执行 | `joint_control_task`：`RobStrideMotionControl(τ, θ, ω, kp, kd)`，`θ_motor = inv·θ_joint + pos_offset` |
+| `RobotTarget_t` 接收 | `usb_trans.c` 收到短包即视为一帧完成，`usb_target_received()` 在临界区里 `memcpy(&rob_target, ...)` 并记 `last_target_tick`，要求整帧一次到齐（104 B） |
+| 轮子执行 | `wheel_control_task`：整帧快照 → `cur = torque·WHEEL_COUNTS_PER_NM` → 限幅 ±16000 → `int16(cur·dir)` → 0x200 帧（0x201/0x202 反馈）。**没有位置环/速度环，也没有 `pid_init`** |
+| 轮子反馈 | `M2006_Receive` 解析转子角度/转速；上报前除以 `WHEEL_GEAR_RATIO`(36:1) 并乘 `dir` 换成**轮轴量**，只用于上位机的里程计与 LQR 状态，不参与控制 |
+| 关节执行 | `joint_control_task`：`RobStrideMotionControl(τ, θ, ω, kp, kd)`，`θ_motor = inv·θ_joint + pos_offset`；同样走整帧快照 |
 | 状态上报 | `state_send_task` 每 10 ms 发 208 B；USB 忙则重试 3 次，仍失败则丢帧（`cdc_state_drop_cnt`） |
-| 看门狗 | **无**。USB 断开后 `rob_target` 保持最后一帧 |
+| 看门狗 | **有**：超 `TARGET_TIMEOUT_MS`(100 ms) 没新帧 → 轮子电流置 0、关节 `kp/kd/τ` 清零（失力）；轮子另有一条 `WHEEL_FB_TIMEOUT_MS`(50 ms) 的 CAN 反馈超时保护（反馈断了就出力矩等于盲给） |
+
+> 电流标定：只有一个宏 `WHEEL_COUNTS_PER_NM`（当前 4500 counts/(N·m)，对应输出侧约 0.18 N·m/A）。
+> **换电机/减速器必须重标**：架空轮子给固定电流测静力矩，或挂已知力臂配重反推。
+> 若 `teach.md` 早期记录的 0.33 N·m/A（≈2482 counts/(N·m)）更接近实测，以实测为准，只改这一个数。
 
 **频率对应关系**
 
@@ -1601,13 +1842,13 @@ typedef struct {
 | 电机环 | — | 333 Hz（`vTaskDelayUntil` 3 ms） |
 
 > 上层 200 Hz 下发、下层 333 Hz 执行、状态 100 Hz 上报：三者频率不同是正常的，
-> 关键约定是“下发的是**目标**而不是增量”，丢一两帧不影响收敛。
+> 关键约定是"下发的是**目标**而不是增量"，丢一两帧不影响收敛。
 
 **上位机侧约定**
 
 - `odom` **不由** `usb_drive` 发布：`leg_control_node` 用 `joint_states` 里的轮端角度差积分出前进弧长、
   再用 IMU yaw 分解成 2D 位姿，并发布 `odom→base_link` 的 TF；轮半径只在 `leg_control_params.yaml` 出现一次。
-- `usb_drive` 只负责“把最近一帧命令搬到 USB”，任何超时都改发安全帧（见第 11 章）。
+- `usb_drive` 只负责"把最近一帧命令搬到 USB"，任何超时都改发安全帧（见第 11 章）。
 
 ---
 
@@ -1652,7 +1893,7 @@ typedef struct {
   `connect`（`lb_rocker_axle↔lefoot_axle`、`rb_rocker_axle↔rifoot_axle`）闭合。
 - 五杆几何（两条腿共用）：`l1=0.050`（O→A）、`l2=0.105`（A→轮轴）、`l3=0.105`（C→B）、
   `l4=0.050`（D→C）、`l5=0.060`（O→D）。**LQR 的高度不再用串联 2R 公式**，改成
-  “髋→足端”距离加质心偏置：
+  "髋→足端"距离加质心偏置：
 
   ```
   foot_y = 髋轴 z − 轮轴 z        h = foot_y + com_offset

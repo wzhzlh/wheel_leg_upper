@@ -3,6 +3,19 @@ leg_control:
     # ================= 500 Hz 统一控制环 =================
     # 一个周期内顺序完成：状态快照 → 状态机 → Pitch LQR → 双 VMC → 轮子分配
     control_rate: 500.0              # 控制环频率 [Hz]
+    debug_rate: 100.0                # 调试类输出频率 [Hz]：/odom + TF + /leg_control/state
+                                     #   控制环仍跑 control_rate，但这三条 500 Hz 发布会把单线程
+                                     #   executor 与订阅端（rviz2 / topic echo）拖垮，日志表现为
+                                     #   “控制环最坏执行时间 xx ms 超过 2 ms 周期”。0 = 不发布
+
+    # ---------------- 控制线程调度优先级 ----------------
+    # 500 Hz = 2 ms 周期，普通 CFS 线程被同机编译/IDE/浏览器抢时间片就是 ms~十 ms 抖动，
+    # 一次 >100 ms 的抖动会让 IMU/关节/轮反馈同时超时 → 故障字 0x23 停机。
+    rt_priority: 60                  # SCHED_FIFO 优先级（1~99）；0 = 不用 FIFO。
+                                     #   需要 CAP_SYS_NICE：sudo setcap cap_sys_nice+ep <可执行文件>
+                                     #   或 /etc/security/limits.conf 加 "<user> - rtprio 80"
+    rt_nice: -10                     # SCHED_FIFO 不可用时的退路（per-thread nice，0 = 不调）；
+                                     #   同样需要权限，失败只打一条 WARN，不影响运行
 
     # ---------------- 机器人物理参数 ----------------
     # 以下数值全部由 src/model/model/wheel_leg.urdf 推导（home 姿态）。
@@ -12,27 +25,30 @@ leg_control:
     # 但轮轴高度会被算成 0.0254，h 偏大到 0.0895）。
     cart_mass: 0.285                 # M：两轮质量之和 [kg]（lefoot 0.130114 + rifoot 0.155050）
     pendulum_mass: 1.904             # m：腿 + 机身（摆杆）质量 [kg]（base 1.667452 + 4 曲柄 0.077208 + 4 连杆 0.159329）
-    com_length: 0.0834               # h：home 姿态摆杆质心到轮轴距离 [m]（URDF 合成质心 z 0.115454 − 轮轴 z 0.032089）
-    com_inertia: 0.00255             # I：摆杆绕自身质心 pitch 惯量 [kg·m²]（URDF 九连杆平行轴合成 2.545e-3）
+    com_length: 0.0343               # h：home 姿态摆杆质心到轮轴距离 [m]
+                                     # 2026-11-01 换 URDF 关节零位后实测：摆杆质心 z 0.06621 − 轮轴 z 0.031909 = 0.0343
+                                     # （旧零位是 0.0834，新零位是深蹲姿，站立靠 com_height 指令把腿撑开）
+    com_inertia: 0.001793            # I：摆杆绕自身质心 pitch 惯量 [kg·m²]（绕轮轴 4.033e-3 减去 m·h²）
     gravity: 9.81                    # g：重力加速度 [m/s²]
-    wheel_radius: 0.030              # r：轮半径 [m]（STL 轮胎外缘 0.0299；URDF 轮轴 z 0.0321，base 原点比地面高约 2 mm）
-    wheel_inertia: 0.0000532         # Jw：两轮绕轮轴等效转动惯量 [kg·m²]（URDF izz 之和 2.339e-5 + 2.983e-5）
+    wheel_radius: 0.030              # r：轮半径 [m]（接触圆柱半径 0.032；两轮静态高度差 3.98 mm）
+    wheel_inertia: 0.0000421         # Jw：两轮绕轮轴等效转动惯量 [kg·m²]（MJCF 两轮 Iyy 之和 4.213e-5）
     input_mode: wheel_torque         # 控制输入定义：wheel_torque（轮轴力矩，N·m）/ force（轮轴等效力，N）
 
     # ---------------- LQR 权重与增益调度 ----------------
-    q_diag: [50.0, 500.0, 10.0, 1.0]  # 状态权重 Q 对角，顺序 [x, theta, x_dot, theta_dot]
+    q_diag: [70.0, 900.0, 15.0, 40.0]  # 状态权重 Q 对角，顺序 [x, theta, x_dot, theta_dot]
     r_weight: 1.0                    # 控制权重 R（1x1，标量）
     gain_mode: quadratic             # 用常数增益（下面 k_coeffs 的常数项），避免 LQR 增益过大导致力矩常年饱和
     k_coeffs: [                      # K_j(h) = c2_j·h² + c1_j·h + c0_j，4 行 x 3 列
       0.0, 0.0, -1.18,               #   行 = [k_x, k_theta, k_x_dot, k_theta_dot]
       0.0, 0.0, -4.52,               #   列 = [h² 系数, h 系数, 常数项]
-      0.0, 0.0, -1.16,               #   取 LQR 增益的 1/6：饱和点 θ≈0.089 rad、θ̇≈1.4 rad/s、x≈0.34 m
+      0.0, 0.0, -2.00,               #   k_x_dot（1.16 → 2.0 以减小线速度稳态误差）：饱和点 θ≈0.089 rad、θ̇≈1.4 rad/s、x≈0.20 m
+                                     #   上限受闭环极点约束：k_x_dot>≈2.1 时 h=0.12 处出现正极点，节点启动会直接抛异常
       0.0, 0.0, -0.28
     ]
     # ---------------- 五杆足端 -> 质心高度：h = 足端_y + com_offset ----------------
     thigh: 0.15                      # [参考] 串联模型大腿长度 l1 [m]（URDF 无双连杆串联腿，主链路已改用五杆，仅单测用）
     shank: 0.15                      # [参考] 串联模型小腿长度 l2 [m]（同上）
-    com_offset: -0.0338              # home 姿态摆杆质心在髋轴下方 [m]（URDF：髋 z 0.1493 − 质心 z 0.115454）
+    com_offset: -0.0289              # home 姿态摆杆质心在髋轴下方 [m]（2026-11-01 实测：髋 z 0.09514 − 质心 z 0.06621）
     h_min: 0.06                      # LQR 增益调度高度下限 [m]
     h_max: 0.12                      # LQR 增益调度高度上限 [m]
     use_measured_height: true        # 是否用关节角实测 h（false 则恒用 com_length 名义值）
@@ -41,7 +57,7 @@ leg_control:
     # ---------------- Pitch 姿态来源 ----------------
     theta_axis: pitch                # 姿态轴：pitch / roll
     theta_offset: 0.0                # IMU 安装零位 [rad]：imu_site 与基座同向，静置 pitch ≈ 0
-    u_max: 0.40                     # 平衡力矩限幅 [N·m]（轮地摩擦上限约 μ·N·r≈0.4，超出就滑移、里程计失真）
+    u_max: 1.0                     # 平衡力矩限幅 [N·m]（轮地摩擦上限约 μ·N·r≈0.4，超出就滑移、里程计失真）
 
     # ---------------- 五杆腿 VMC（两条腿共用几何，各自独立状态） ----------------
     l1: 0.050                        # O→A 前摆臂长度 [m]（URDF |lf_joint1→lf_joint2| = 0.0500，左右一致）
@@ -59,7 +75,7 @@ leg_control:
     kd_y: 40.0                       # 足端上下阻尼 [N·s/m]
     force_max_x: 40.0                # 足端前后力限幅 [N]，<=0 表示该轴不限
     force_max_y: 150.0               # 足端上下力限幅 [N]，<=0 表示该轴不限
-    foot_target_x: 0.03              # 足端前后目标位置 [m]（中位 = 两髋中点 l5/2；足端 y 由质心高度指令决定）
+    foot_target_x: 0.0314            # 足端前后目标位置 [m]（两髋中点 l5/2=0.03，按新零位实测 0.0314；y 由质心高度指令决定）
     joint_torque_max: 8.0            # 单关节力矩限幅 [N·m]
     joint_torque_sign: [1.0, 1.0, 1.0, 1.0]  # 四关节力矩符号 [左髋, 左膝, 右髋, 右膝]，方向反了改成 -1
 
@@ -69,31 +85,55 @@ leg_control:
     # 右腿整体绕 x 轴转了 180°，关节轴在 base 系里反向，所以 joint_sign 取 -1。
     # 数值来源：MuJoCo 里量 曲柄髋心→肘心 的平面方向（q=0 与 q=±0.4 线性拟合，斜率恰为 ±1），
     # 残差 1e-3 度；标定后控制器 FK 复算的足端与模型差 < 0.3 mm（teach.md 12.7）。
-    # 注意：换 CAD / 换减速器零位后这 8 个数要重测。
+    # 注意：电控王换 CAD / 换减速器零位后这 8 个数要重测。
     joint_sign: [1.0, 1.0, -1.0, -1.0]
-    joint_offset: [2.155471, 0.598858, 2.092103, 0.970701]  # [rad]
+    joint_offset: [-3.0285, -0.1911, -3.0411, -0.1293]  # [rad]
+    # 2026-11-01 按新 URDF 零位（lf1 rpy -1.1、lb1 rpy +0.79、rf1 -1.15、rb1 +1.1）重标定：
+    # α_L=α(0)=-3.0285、β_L=-0.1911、α_R=-3.0411、β_R=-0.1293；joint_sign 仍为 [+1,+1,-1,-1]
+    # 旧值：[2.155471, 0.598858, 2.092103, 0.970701]
 
     # ---------------- 目标质心高度（上层指令修改，控制环内做斜坡；内部换算 足端_y = h - com_offset） ----------------
-    # 注意：foot_y = com_height - com_offset。按 URDF l1=0.0500、l2=0.1050、l5=0.0600，
-    # 五杆足端竖直可达上限只有约 0.148 m（曲柄与连杆共线时 = 奇异位形）。
-    # home 姿态（URDF/MJCF 站立零位）foot_y = 0.1172 m（髋 z 0.1493 − 轮轴 z 0.0321），
-    # 摆杆质心在髋轴下方 0.0338 m，故 h = 0.0834 m。
-    com_height_default: 0.0834       # 默认目标与 home 姿态一致（换算 foot_y = 0.1172 m）
+    # 注意：foot_y = com_height - com_offset（com_offset 为负，即 foot_y = h + |com_offset|）。
+    # 按新 URDF 零位扫过工作空间：foot_x≈0.031 时 foot_y ∈ [0.046, 0.152]，
+    # 换算 h ∈ [0.017, 0.123]；再往上曲柄/连杆接近共线（奇异位形）。
+    # home 姿态（关节全 0）是深蹲：foot_y = 0.0612、h = 0.0343；站立靠下面的指令把腿撑开。
+    com_height_default: 0.0834       # 默认站立目标（换算 foot_y = 0.1123 m，实测 h≈0.067）
     com_height_min: 0.065            # 足端目标 y=0.0988 m
     com_height_max: 0.100            # 足端目标 y=0.1338 m（约 90% 行程），避开伸直奇异位形
     com_height_rate: 0.30            # 目标质心高度变化率上限 [m/s]（避免阶跃）
 
-    # ---------------- 轮子控制与分配 ----------------
-    wheel_separation: 0.305          # 轮距 L [m]（URDF 两轮轴 y = ±0.1525；按轮胎接地中心线量约 0.297）
+    # ---------------- 轮子控制与分配（实机主通道 = /wheel_target 速度） ----------------
+    # 固件 wheel_control_task 是"位置外环 + 速度内环"的双环 PID，只接速度目标：
+    #   ω_ref = clamp(平衡分量 + 差速行驶分量)  →  固件位置环把它积分成角度目标并锁定
+    #   平衡分量 = LQR 力矩 u × balance_torque_to_omega（一阶漏积分平滑）
+    #   差速分量 = (v_des ∓ 0.5·L·ω_des) / r，再各自夹到 max_drive_omega
     max_linear_velocity: 1.0         # 车体线速度 v 限幅 [m/s]
     max_yaw_rate: 3.0                # 车体偏航角速度 ω 限幅 [rad/s]
-    max_wheel_omega: 20.0            # 单轮角速度总限幅 [rad/s]（平衡 + 行驶之和）
+                                     #   仿真 launch 覆盖成 0.20：原地偏航靠横向擦地，0.2 已接近摩擦极限（12.13）
+    wheel_separation: 0.305          # 轮距 L [m]（URDF 两轮 y = ±0.1525；按轮胎接地中心线量约 0.297）
+    max_wheel_omega: 20.0            # 单轮角速度总限幅 [rad/s]（平衡 + 行驶）
     max_balance_omega: 8.0           # 平衡分量限幅 [rad/s]
-    max_drive_omega: 12.0            # 行驶分量限幅 [rad/s]
-    # LQR 的力矩型输出 → 轮速目标的折算系数 [rad/s per N·m]，
-    # 下位机 M2006 是位置-速度串级 PID，只能接速度目标，故在此折算，需实机标定
-    balance_torque_to_omega: 1.0
-    balance_leak_rate: 60.0          # 平衡轮速指令一阶低通系数 [1/s]（可参数化，之前硬编码 6.0）
+    max_drive_omega: 12.0            # 行驶 / 转向分量限幅 [rad/s]：留出平衡余量（合计受
+                                     #   max_wheel_omega 约束）。12 rad/s × r=0.030 ≈ 0.36 m/s，
+                                     #   想跑更快就同时加大 max_linear_velocity 与这一项
+    # LQR 的力矩型输出 → 轮速目标的折算系数 [rad/s per N·m]：
+    # 固件只能接速度，所以平衡力矩在这里折算成轮速；放大系数越大平衡越"猛"，需实机标定
+    balance_torque_to_omega: 20.0
+    balance_leak_rate: 60.0          # 平衡轮速指令一阶低通系数 [1/s]（越大跟随越快，越小越柔）
+
+    # ---------------- 轮子力矩前馈通道（可选，默认关） ----------------
+    # 固件把帧里的 torque 当**前馈**加到速度环输出上（task.c: wheel_velocity_pid.pid_out
+    # + torque·WHEEL_COUNTS_PER_NM，再统一限幅）。主通道仍是 /wheel_target，
+    # 这里打开等于在速度环之上再叠一层力矩，容易和位置环互相顶，默认关。
+    wheel_torque_enable: false       # false = /wheel_torque 恒为 0；true = 启用下面的前馈
+    wheel_torque_max: 0.40           # 单轮力矩前馈限幅 [N·m]（≈轮地摩擦 μ·N·r）
+    k_vel_p: 1.0                     # 线速度误差 P [N·m per (m/s)]，左右同相：0.1 m/s 误差 → 0.1 N·m
+    k_yaw_p: 0.15                    # 偏航角速度误差 P [N·m per (rad/s)]，左右反相（力矩差转向）
+    yaw_ff: 0.06                     # 偏航角速度前馈 [N·m per rad/s]，左右差动力矩
+    k_vel_i: 0.0                     # 线速度积分 [N·m per (m/s) per s]（补静摩擦死区），限幅 ±0.5·wheel_torque_max
+    k_yaw_i: 0.0                     # 偏航角速度积分 [N·m per (rad/s) per s]（同上）
+    wheel_brake_damp: 0.02           # 仅力矩前馈模式：非平衡态（未使能 / FAULT）阻尼制动 [N·m/(rad/s)]
+                                     #   速度通道下非平衡态直接给 ω_ref = 0，由固件位置环锁住
 
     # ---------------- 安全门限（状态机见 control_state.hpp） ----------------
     imu_timeout: 0.10                # IMU 数据年龄上限 [s]，超过置 kFaultImu
@@ -131,6 +171,12 @@ command_param:
     com_height_min: 0.065            # [限幅] 质心高度安全下限 [m]，防止腿过分收缩导致机构产生机械干涉或触底
     com_height_max: 0.100            # [限幅] 质心高度安全上限 [m]，防止腿伸得太直逼近奇异位形（约 90% 行程）
     max_pitch_target: 0.30           # [限幅] 目标 Pitch 角最大绝对值 [rad]（约 11.5°），防止指令过大导致机器人倾覆
+    cmd_vel_topic: cmd_vel           # [话题] 上层速度命令（geometry_msgs/Twist），只取 linear.x / angular.z；
+                                     #   收到即切 TELEOP（仍需 enable=true），比参数更适合导航/遥控程序连续发
+    use_cmd_vel: true                # [开关] 是否订阅 cmd_vel；关掉就只能用 linear_velocity / yaw_rate 参数给速度
+    cmd_vel_timeout: 0.5             # [安全] 超过该时间没有新 cmd_vel 就把速度归零 [s]，防止上层掉线后机器人继续跑
+    max_linear_accel: 0.30           # [斜坡] 线速度指令跟踪加速度上限 [m/s²]；力矩型平衡环对速度阶跃很敏感，必须限加速
+    max_yaw_accel: 1.0               # [斜坡] 偏航角速度指令跟踪角加速度上限 [rad/s²]
 
     # =========================================================================
     # 第二部分：动态运行指令（支持通过 rqt_reconfigure / ros2 param set 实时动态修改）

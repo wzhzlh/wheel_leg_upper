@@ -7,12 +7,13 @@
 //   * 固件没有使用 #pragma pack，结构体依赖自然对齐，
 //     因此这里同样不做打包，并用 static_assert 校验长度与关键偏移；
 //   * 固件按“结构体裸内存”收发，无包头/magic/包类型字段，
-//     上位机需按固定长度拆帧（RobotTarget_t 96 B / RobotState_t 208 B）。
+//     上位机需按固定长度拆帧（RobotTarget_t 104 B / RobotState_t 208 B）。
 //
 // 固件中的对应关系：
 //   RobotTarget_t : usb_target_received() -> memcpy(&rob_target, ...)
 //   RobotState_t  : state_send_task()    -> CDC_Transmit_FS(&rob_state, sizeof(rob_state))
 
+#include <stddef.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -20,12 +21,23 @@ namespace usb_drive
 {
 #endif
 
-/// 轮子目标 / 反馈（M2006 + 位置-速度串级 PID）
+/// 轮子反馈（M2006 编码器）
 typedef struct
 {
   float angle;   ///< 角度 [rad]
   float omega;   ///< 角速度 [rad/s]
 } Wheel_t;
+
+/// 轮子目标（上位机 -> 下位机）
+/// 下位机是"位置外环 + 速度内环"的双环 PID（task.c wheel_control_task）：
+///   vel_ref = pos_pid(angle, angle_target).out + WHEEL_OMEGA_FF_GAIN(=1.0) * omega
+///   current = vel_pid(omega, vel_ref).out + torque * 4500 counts/(N*m)
+typedef struct
+{
+  float angle;   ///< 位置环目标 [rad]（上位机按 omega 积分得到；固件夹到实测角 ±0.5 rad）
+  float omega;   ///< 速度环参考 + 全量前馈 [rad/s]（正 = 前进）
+  float torque;  ///< 力矩前馈 [N*m]（叠加在速度环输出上，默认 0 = 关闭）
+} WheelTarget_t;
 
 /// 关节目标（RobStride 运动控制：τ = kp*(angle-θ) + kd*(omega-ω) + torque）
 typedef struct
@@ -48,14 +60,16 @@ typedef struct
   float temperature;  ///< 温度 [℃]
   float vbus;         ///< 母线电压 [V]
   uint64_t error;     ///< 故障码
-  uint8_t feedback;   ///< 反馈类型（0 失能 / 1 使能 ...）
+  /// 状态字（位标志，不是 0~8 枚举）：实测电机未使能时上报 0x80，
+  /// 仅用于诊断，上位机不得据此判定帧非法
+  uint8_t feedback;
 } JointState_t;
 
-/// 上位机 -> 下位机（96 B）
+/// 上位机 -> 下位机（104 B）
 typedef struct
 {
-  Wheel_t wheel[2];
-  JointTarget_t joint[4];
+  WheelTarget_t wheel[2];  ///< 24 B（12 B/轮）
+  JointTarget_t joint[4];  ///< 80 B（20 B/关节）
 } RobotTarget_t;
 
 /// 下位机 -> 上位机（208 B）
@@ -66,6 +80,14 @@ typedef struct
 } RobotState_t;
 
 #ifdef __cplusplus
+// 与固件 task.h 一一对应的长度/偏移校验：任一处不一致就在编译期报错
+static_assert(sizeof(Wheel_t) == 8, "Wheel_t 必须 8 B");
+static_assert(sizeof(WheelTarget_t) == 12, "WheelTarget_t 必须 12 B");
+static_assert(sizeof(JointTarget_t) == 20, "JointTarget_t 必须 20 B");
+static_assert(sizeof(RobotTarget_t) == 104, "RobotTarget_t 必须 104 B");
+static_assert(offsetof(RobotTarget_t, joint) == 24, "joint 偏移必须为 24");
+static_assert(sizeof(RobotState_t) == 208, "RobotState_t 必须 208 B");
+
 }  // namespace usb_drive
 #endif
 

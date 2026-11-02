@@ -67,8 +67,12 @@ sim_bridge:
     # 轮子惯量极小（J≈3e-5 kg·m²），P 有个硬上限：kp < 2J/Δt ≈ 0.03，超过直接抖
     wheel_kp: 0.02                             # [N·m per rad/s]
     wheel_ki: 2.0                              # [N·m per (rad/s·s)]，靠积分把力矩垫上去
-    wheel_tau_max: 3.0                         # 轮子力矩限幅 [N·m]，与 MJCF motor ctrlrange 一致
-    wheel_mode: torque                         # /wheel_target 直接当轮轴力矩（LQR 本来就是力矩输出）
+    wheel_tau_max: 1.2                         # 轮子力矩限幅 [N·m]。torque 模式下 /wheel_target 的数值就是力矩，
+                                               # 给到 3.0 时一条 0.3 m/s 的行驶指令就是 10 N·m×限幅，机器人直接冲出去；
+                                               # 但也不能太小：0.5 时 v≥0.7 m/s 的"平衡 + 阻尼前馈"会被截断，
+                                               # 轮速跟不上 → 俯仰失稳摔倒（teach.md 12.14 的实测）。
+                                               # 1 m/s 稳态约需 0.71 N·m，取 1.2 留余量，仍低于 MJCF 的 ±3 N·m
+    wheel_mode: torque                         # 优先吃 /wheel_torque（力矩通道）；收不到时退回 /wheel_target
     wheel_torque_gain: 1.0                     # torque 模式下的力矩增益
     wheel_start_delay: 1.45                    # 仅在 wheel_arm_on_gate=false 时生效
     wheel_arm_on_gate: true                    # 跟门控 latched 话题：物理步进真正放开的那一刻才开始下发轮子力矩，

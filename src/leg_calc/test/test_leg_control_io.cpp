@@ -58,6 +58,26 @@ TEST(LegControlIO, RejectsNonFiniteJointAndWheelFeedback)
   EXPECT_FALSE(io.build(1.05, 0.03).joint_ok);
 }
 
+TEST(LegControlIO, ForeignJointStatesDoNotInvalidateFeedback)
+{
+  // 同一个 /joint_states 上还有别的机器人时，不能因为"消息里没有本机关节"就判本机反馈失效
+  leg_calc::SnapshotIO io;
+  io.onJointStates(validJoints(), kLegNames, kWheelNames, 1.0);
+  EXPECT_TRUE(io.build(1.01, 0.03).joint_ok);
+
+  sensor_msgs::msg::JointState foreign;
+  foreign.name = {"base_to_chassis", "front_left_steer_joint", "front_left_drive_joint"};
+  foreign.position = {0.0, 0.1, 0.2};
+  foreign.velocity = {0.0, 0.0, 0.0};
+  io.onJointStates(foreign, kLegNames, kWheelNames, 1.02);
+
+  const auto snapshot = io.build(1.03, 0.03);
+  EXPECT_TRUE(snapshot.joint_ok);
+  EXPECT_TRUE(snapshot.wheel_ok);
+  EXPECT_NEAR(snapshot.joint_age, 0.03, 1e-12);   // 时间戳不能被别人的消息刷新
+  EXPECT_NEAR(snapshot.wheel_age, 0.03, 1e-12);
+}
+
 TEST(LegControlIO, InvalidCommandDoesNotRefreshAge)
 {
   leg_calc::SnapshotIO io;

@@ -104,8 +104,9 @@ def generate_launch_description():
     )
     enable_arg = DeclareLaunchArgument(
         "enable",
-        default_value="false",
-        description="启动时是否直接使能平衡（等价于启动后把 /command_param 的 enable 置 true）",
+        default_value="true",
+        description="启动时是否直接使能平衡。仿真默认 true（否则一直停在 IDLE 不会站起来）；"
+                    "想先手动检查可用 enable:=false，再 ros2 param set /command_param enable true",
     )
 
     # ---------------- 节点 ----------------
@@ -176,7 +177,15 @@ def generate_launch_description():
         name="leg_control",
         output="screen",
         condition=IfCondition(LaunchConfiguration("use_control")),
-        parameters=[leg_params, {"startup_cycles": 100}],
+        # 行驶由 LQR 的速度参考负责（仿真桥把 /wheel_target 当力矩用，力矩通道只有实机走）
+        # max_yaw_rate 降到 0.2：原地偏航靠横向擦地，仿真实测 0.2 rad/s 已接近摩擦极限
+        # （0.3 会擦滑把俯仰顶翻）；限幅后超范围的指令只会饱和，不会倒地
+        # 仿真走力矩通道：leg_control 把 LQR u / 速度 P / 偏航力矩直接发到 /wheel_torque，
+        # sim_bridge 以 N·m 下发（速度通道的 20·u rad/s 在 torque 模式会被当成 20 倍力矩）。
+        # k_vel_p 必须给 0：LQR 的 k_x_dot=-2.0 已经在做速度反馈，再叠一层 -1.0·ẋ
+        # 等效 k_x_dot=3.0，超过 12.13 量到的稳定上限 2.1，会变成 ±2 rad/s 的极限环
+        parameters=[leg_params, {"startup_cycles": 100, "max_yaw_rate": 0.20,
+                                 "wheel_torque_enable": True, "k_vel_p": 0.0}],
     )
 
     # 仿真 I/O 桥：补 IMU 姿态，并把 joint_target / wheel_target 翻译成

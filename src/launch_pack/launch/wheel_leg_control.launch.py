@@ -58,6 +58,10 @@ def generate_launch_description():
     pid_arg = DeclareLaunchArgument('pid', default_value='22336', description='USB PID')
     send_rate_arg = DeclareLaunchArgument(
         'send_rate', default_value='200.0', description='下位机指令发送频率 [Hz]')
+    wheel_torque_gain_arg = DeclareLaunchArgument(
+        'wheel_torque_gain', default_value='0.0',
+        description='/wheel_torque → 帧里 wheel[].torque 的缩放（0 = 用力矩前馈；'
+                    '固件已恢复 PID 双环，执行主通道是 /wheel_target）')
 
     imu_driver = Node(
         package='imu_ros2_device',
@@ -100,6 +104,10 @@ def generate_launch_description():
             'vid': ParameterValue(LaunchConfiguration('vid'), value_type=int),
             'pid': ParameterValue(LaunchConfiguration('pid'), value_type=int),
             'send_rate': ParameterValue(LaunchConfiguration('send_rate'), value_type=float),
+            # 固件是位置+速度双环，实机执行通道是 /wheel_target；
+            # torque 只是叠加在速度环输出上的前馈，默认 0（关）
+            'wheel_torque_gain': ParameterValue(
+                LaunchConfiguration('wheel_torque_gain'), value_type=float),
         }],
     )
 
@@ -114,6 +122,7 @@ def generate_launch_description():
         vid_arg,
         pid_arg,
         send_rate_arg,
+        wheel_torque_gain_arg,
         imu_driver,
         leg_control,
         command_param,

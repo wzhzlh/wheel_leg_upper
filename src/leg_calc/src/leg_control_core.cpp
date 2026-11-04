@@ -125,7 +125,11 @@ void LegController::updateComHeightTarget(const RobotCommand & command, double d
     target, config_.com_height_min, config_.com_height_max);
 
   const double step = config_.com_height_rate * std::max(0.0, dt);
+  const double prev_cmd = com_height_cmd_;
   com_height_cmd_ += std::clamp(com_height_target_ - com_height_cmd_, -step, step);
+  // 腿长指令的实际变化率 [m/s]（正 = 腿在伸长）：作为 VMC 的足端速度前馈。
+  // 指令已到位的稳态下它恒为 0，不会影响站立刚性。
+  com_height_vel_ = (dt > 0.0) ? (com_height_cmd_ - prev_cmd) / dt : 0.0;
 }
 
 Eigen::Vector2d LegController::legJointAngles(const StateSnapshot & snapshot, int leg) const
@@ -221,20 +225,32 @@ std::array<double, 4> LegController::computeJointTorques(const StateSnapshot & s
       config_.joint_sign[i0] * snapshot.joint_velocity[i0],
       config_.joint_sign[i0 + 1] * snapshot.joint_velocity[i0 + 1]);
 
+    // 足端目标速度：腿长指令在动的时候足端 y 必须同步移动。
+    // 传 0 会让 kd_y 一直按 (0 − ẋ) 反向阻尼（0.30 m/s × kd_y=70 ≈ 21 N），
+    // 把腿死死拖住 —— 改腿长又慢又抖，还向机身注入俯仰扰动。
+    const Eigen::Vector2d foot_vel_target(0.0, com_height_vel_);
+
     VmcLegState vmc_state;
     if (!computeVmcLeg(
-        config_.fivebar, config_.vmc, q, q_dot, foot_target, Eigen::Vector2d::Zero(),
-        &vmc_state))
+        config_.fivebar, config_.vmc, q, q_dot, foot_target, foot_vel_target, &vmc_state))
     {
       // 该腿不可装配 / 奇异：保持零力矩，另一条腿照常输出
       continue;
     }
 
+    // 重力前馈：摆杆重量 m·g 由两条腿分担，每条 m·g/2 沿 +y（蹬地撑住机身）。
+    // 抵消 VMC 的静态下蹲量 mg/(2·kp_y)（kp_y=2500 时约 3.7 mm）。
+    Eigen::Vector2d foot_force = vmc_state.foot_force;
+    if (config_.vmc_gravity_comp) {
+      foot_force(1) += 0.5 * config_.model.pendulum_mass * config_.model.gravity;
+    }
+    const Eigen::Vector2d tau_vmc = vmc_state.jacobian.transpose() * foot_force;
+
     for (size_t k = 0; k < 2; ++k) {
       const size_t joint = i0 + k;
       // ∂α/∂q = joint_sign，所以 q 空间的力矩要乘同一个符号
       const double tau =
-        config_.joint_sign[joint] * vmc_state.joint_torque(static_cast<Eigen::Index>(k));
+        config_.joint_sign[joint] * tau_vmc(static_cast<Eigen::Index>(k));
       torque[joint] = std::clamp(
         tau * config_.joint_torque_sign[joint],
         -config_.joint_torque_max, config_.joint_torque_max);
@@ -325,9 +341,12 @@ std::array<double, 2> LegController::computeWheelTorques(
   double tau_yaw = config_.yaw_ff * w_des + config_.k_yaw_p * (w_des - yaw_rate_filt_);
   if (config_.k_yaw_i > 0.0) {
     if (tracking) {
+      // 偏航积分限幅用满 wheel_torque_max（而不是 0.5）：转向是**差模**，
+      // 左右各 ±τ_yaw → 实际力矩差 2·τ_yaw，原地转向要突破 μ·N·L/2 ≈ 2.1 N·m，
+      // 所以单侧积分必须能到 ~1 N·m，否则永远破不了静摩擦死区。
       yaw_i_ = std::clamp(
         yaw_i_ + config_.k_yaw_i * (w_des - yaw_rate_filt_) * std::max(0.0, dt),
-        -0.5 * config_.wheel_torque_max, 0.5 * config_.wheel_torque_max);
+        -config_.wheel_torque_max, config_.wheel_torque_max);
     } else {
       yaw_i_ = 0.0;
     }

@@ -14,7 +14,8 @@
  * 注意：固件按结构体裸内存收发，没有包头和长度字段，因此上位机必须按固定长度拆帧；
  *       USB bulk 可能出现粘包/拆包，这里用累积缓冲区重组。
  *
- * 频率：默认 200 Hz 下发（下位机控制环 250 Hz、状态上报 100 Hz）。
+ * 频率：默认 250 Hz 下发（= 500 Hz 控制环的整数分频，也与固件 250 Hz 收发对齐；
+ *       200 Hz 与 250 Hz 互质，会形成 5 Hz 的拍频抖动，2026-11-04 改）。状态上报 100 Hz。
  * 三重兜底：
  *   ① 控制指令超时（command_timeout）→ 轮子力矩置 0（失力）、关节失力
  *   ② 状态帧超时（state_timeout）→ 立即改发安全帧，不再下发过期指令
@@ -167,10 +168,12 @@ public:
     }
 
     // ---------------- 通信参数 ----------------
-    // 200 Hz 下发：与“500 Hz 控制环 / 50 Hz 上层命令”解耦，只保证命令搬运带宽
+    // 250 Hz 下发：500 Hz 控制环 ÷2，且等于固件 wheel_control_task 的 4 ms 周期。
+    // 之前 200 Hz 与 250 Hz 互质，每 5 帧才对齐一次（5 Hz 拍频），力矩会在
+    // "有新帧 / 复用旧帧"之间抖动；现在每帧都是新算的，节拍恒定。
     command_timeout_ = declare_parameter("command_timeout", 0.3);
     state_timeout_ = declare_parameter("state_timeout", 0.5);
-    send_rate_ = declare_parameter("send_rate", 200.0);
+    send_rate_ = declare_parameter("send_rate", 250.0);
 
     max_wheel_torque_ = declare_parameter("max_wheel_torque", 1.0);
     // /wheel_torque → 帧里 wheel[i].torque 的缩放。
@@ -568,7 +571,7 @@ private:
   // 通信参数
   double command_timeout_{0.3};
   double state_timeout_{0.5};
-  double send_rate_{200.0};
+  double send_rate_{250.0};
 
   /// 保护下面所有“跨线程共享的实时状态”：
   ///   写：ROS 订阅回调（命令）、USB 事件线程（反馈）

@@ -68,6 +68,8 @@ private:
   /// 力矩前馈通道的一阶低通状态 [N·m]：500 Hz 直通会激励腿部/俯仰谐振
   std::array<double, 2> wheel_torque_state_{{0.0, 0.0}};
   double com_height_{0.30};
+  /// 腿长指令的实际变化率 [m/s]（正 = 伸长）：VMC 足端速度前馈用
+  double com_height_vel_{0.0};
   /// 偏航角速度反馈的低通值 [rad/s]（IMU 角速度 200 Hz 更新，直接进 P 会抖）
   double yaw_rate_filt_{0.0};
   /// 力矩前馈模式（wheel_torque_enable=true）的速度/偏航积分微调量（N·m）

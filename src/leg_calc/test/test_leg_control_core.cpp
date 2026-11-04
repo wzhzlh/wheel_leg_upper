@@ -372,6 +372,9 @@ TEST(LegControlCore, JointCalibrationMapsToSameFiveBarAngles)
     s_plain.joint_position[static_cast<size_t>(i)] += kHalfPi;
   }
 
+  // 该用例验证纯 VMC 的反对称性；重力前馈由 VmcGravityFeedforward 单独覆盖
+  plain.vmc_gravity_comp = false;
+  shifted.vmc_gravity_comp = false;
   leg_calc::LegController a(plain);
   leg_calc::LegController b(shifted);
   const auto out_a = runUntil(a, s_plain, leg_calc::ControlState::kRun);
@@ -382,5 +385,101 @@ TEST(LegControlCore, JointCalibrationMapsToSameFiveBarAngles)
     EXPECT_NEAR(
       out_b.joint_torque[static_cast<size_t>(i)],
       -out_a.joint_torque[static_cast<size_t>(i)], 1e-9);
+  }
+}
+
+TEST(LegControlCore, VmcGravityFeedforwardAddsSupportTorque)
+{
+  // 足端 m·g/2 前馈经 Jᵀ 映射后应产生明显的支撑力矩（消除静态下蹲）
+  auto on = makeConfig();
+  on.vmc_gravity_comp = true;
+  auto off = makeConfig();
+  off.vmc_gravity_comp = false;
+
+  leg_calc::LegController c_on(on);
+  leg_calc::LegController c_off(off);
+  const auto s = makeSnapshot(true);
+  const auto r_on = runUntil(c_on, s, leg_calc::ControlState::kRun);
+  const auto r_off = runUntil(c_off, s, leg_calc::ControlState::kRun);
+
+  double diff = 0.0;
+  for (size_t i = 0; i < 4; ++i) {
+    diff += std::abs(r_on.joint_torque[i] - r_off.joint_torque[i]);
+  }
+  // 单腿 m·g/2 = 1.904×9.81/2 ≈ 9.34 N，乘雅可比后四关节合计应有 1 N·m 量级
+  EXPECT_GT(diff, 0.5);
+}
+
+TEST(LegControlCore, HeightRampStaysWithinTorqueLimits)
+{
+  // 腿长斜坡期间：VMC 拿到足端速度前馈，力矩应保持有限、不超限、不来回翻转
+  auto cfg = makeConfig();
+  cfg.vmc.kp = Eigen::Vector2d(300.0, 2500.0);
+  cfg.vmc.kd = Eigen::Vector2d(22.0, 70.0);
+  cfg.com_height_rate = 0.50;
+  leg_calc::LegController controller(cfg);
+
+  auto s = makeSnapshot(true);
+  s.command.com_height = 0.30;   // 低于默认 0.40，腿要收缩
+  (void)runUntil(controller, s, leg_calc::ControlState::kRun);
+
+  double max_abs = 0.0;
+  for (int i = 0; i < 100; ++i) {   // 0.2 s
+    const auto out = controller.step(s, 0.002);
+    for (double tau : out.joint_torque) {
+      EXPECT_TRUE(std::isfinite(tau));
+      max_abs = std::max(max_abs, std::abs(tau));
+    }
+  }
+  EXPECT_LE(max_abs, cfg.joint_torque_max);
+  // 0.5 m/s × 0.2 s = 0.1 m 的斜坡上限，指令应从 0.40 明显下降
+  EXPECT_LT(controller.comHeightCommand(), 0.40);
+}
+
+TEST(LegControlCore, YawIntegralBuildsDifferentialTorque)
+{
+  // 原地转向：w_des=1、陀螺反馈 0 时，k_yaw_p + k_yaw_i 必须把差模推过摩擦阈值（≈2.1 N·m）
+  auto cfg = makeConfig();
+  cfg.wheel_torque_enable = true;
+  cfg.k_yaw_p = 1.2;
+  cfg.k_yaw_i = 0.6;
+  cfg.wheel_torque_max = 1.0;
+  cfg.max_yaw_rate = 1.0;
+  leg_calc::LegController controller(cfg);
+
+  auto s = makeSnapshot(true, 0.0, 1.0);
+  s.yaw_rate = 0.0;
+  leg_calc::ControlOutput out;
+  for (int i = 0; i < 200; ++i) {   // 0.4 s
+    out = controller.step(s, 0.002);
+  }
+  ASSERT_EQ(out.state, leg_calc::ControlState::kRun);
+  const double diff = out.wheel_torque_ref[1] - out.wheel_torque_ref[0];
+  EXPECT_GT(diff, 1.5);   // 差模应朝 2.0 N·m（±wheel_torque_max）增长
+}
+
+TEST(LegControlCore, OnlineLqrSolvesAcrossHeightRange)
+{
+  // 部署用的是 online_lqr + q=[50,500,10,1] + R=36；节点启动时会对 h∈[h_min,h_max]
+  // 扫 11 个点做同样的稳定性校验，这里提前把它钉住，避免改 Q/R 后实机起不来。
+  auto cfg = makeConfig();
+  cfg.gain_mode = leg_calc::GainMode::kOnlineLqr;
+  cfg.Q = Eigen::Vector4d(50.0, 500.0, 10.0, 1.0).asDiagonal();
+  cfg.R = Eigen::MatrixXd::Constant(1, 1, 36.0);
+  cfg.h_min = 0.06;
+  cfg.h_max = 0.12;
+
+  leg_calc::GainSchedule gains(cfg.model, cfg.gain_mode);
+  gains.setWeights(cfg.Q, cfg.R);
+  gains.setHeightLimits(cfg.h_min, cfg.h_max);
+
+  for (int i = 0; i <= 10; ++i) {
+    const double h = cfg.h_min + (cfg.h_max - cfg.h_min) * static_cast<double>(i) / 10.0;
+    const auto g = gains.gainAt(h);
+    EXPECT_TRUE(gains.lastSolveOk()) << "h=" << h;
+    EXPECT_TRUE(g.allFinite()) << "h=" << h;
+    // k_theta 必须为负（前倾 → 正力矩）且幅值足够撑住倒立摆，又不能 1° 就打到 u_max
+    EXPECT_LT(g(0, 1), -1.0) << "h=" << h;
+    EXPECT_GT(g(0, 1), -15.0) << "h=" << h;
   }
 }

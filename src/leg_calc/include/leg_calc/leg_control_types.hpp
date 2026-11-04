@@ -46,6 +46,8 @@ struct ControllerConfig
 
   FiveBarGeometry fivebar;
   SpringDamperParams vmc;
+  /// 重力前馈：足端额外加 m·g/2（经 Jᵀ 映射成关节力矩），抵消 VMC 静态压缩
+  bool vmc_gravity_comp{true};
   double foot_target_x{0.05};
   double com_height_default{0.40};
   double com_height_min{0.25};

@@ -34,16 +34,28 @@ leg_control:
     wheel_inertia: 0.0000421         # Jw：两轮绕轮轴等效转动惯量 [kg·m²]（MJCF 两轮 Iyy 之和 4.213e-5）
     input_mode: wheel_torque         # 控制输入定义：wheel_torque（轮轴力矩，N·m）/ force（轮轴等效力，N）
 
-    # ---------------- LQR 权重与增益调度 ----------------
-    q_diag: [70.0, 900.0, 15.0, 40.0]  # 状态权重 Q 对角，顺序 [x, theta, x_dot, theta_dot]
-    r_weight: 1.0                    # 控制权重 R（1x1，标量）
-    gain_mode: quadratic             # 用常数增益（下面 k_coeffs 的常数项），避免 LQR 增益过大导致力矩常年饱和
-    k_coeffs: [                      # K_j(h) = c2_j·h² + c1_j·h + c0_j，4 行 x 3 列
-      0.0, 0.0, -1.18,               #   行 = [k_x, k_theta, k_x_dot, k_theta_dot]
-      0.0, 0.0, -4.52,               #   列 = [h² 系数, h 系数, 常数项]
-      0.0, 0.0, -2.00,               #   k_x_dot（1.16 → 2.0 以减小线速度稳态误差）：饱和点 θ≈0.089 rad、θ̇≈1.4 rad/s、x≈0.20 m
-                                     #   上限受闭环极点约束：k_x_dot>≈2.1 时 h=0.12 处出现正极点，节点启动会直接抛异常
-      0.0, 0.0, -0.28
+    # ---------------- LQR 权重与增益调度（四状态：x, θ, ẋ, θ̇） ----------------
+    # 四个状态的来源（已逐项核对）：
+    #   x   = 0.5·(angle_L + angle_R)·r   轮端多圈绝对转角 × 轮半径 [m]，正 = 前进
+    #   ẋ   = 0.5·(w_L + w_R)·r           轮端角速度 × 轮半径 [m/s]（固件已 ÷36 减速比、乘 dir）
+    #   θ   = IMU 四元数 ZYX → pitch − theta_offset [rad]，正 = 前倾
+    #   θ̇   = IMU angular_velocity.y [rad/s]，与 θ 同轴
+    # 注意 x 没有起点锚定（轮子转几米后 x 就是几米），所以 computeBalanceTorque 里
+    # ref(kX)/ref(kXdot) 恒跟随实测（误差 0）：LQR 只做姿态，行驶/转向由轮子分配层的
+    # k_vel_p / k_yaw_p 负责。若把 x 当位置误差，u 会立刻顶到 u_max（实测 x=-27 m 时
+    # 位置项 31.8、姿态项 0.07，轮子永远饱和）。
+    # Q/R 设计：R=36 是有意保留的余量（等效把 K 缩到 1/6）。
+    #   q=[50,500,10,1], R=36  → K≈[-1.18, -5.22, -1.17, -0.33]，极点 -111/-21.8/-1.41±1.01j
+    #   q=[50,500,10,1], R=1   → K≈[-7.07, -27.2, -6.94, -1.74]，θ 到 0.9° 就饱和（bang-bang）
+    # h∈[0.06,0.12] 内 K 变化 <3%，online_lqr 的缓存阈值已放宽到 2 mm，不会每周期重算。
+    q_diag: [50.0, 500.0, 10.0, 1.0]  # 状态权重 Q 对角，顺序 [x, theta, x_dot, theta_dot]
+    r_weight: 36.0                   # 控制权重 R（1x1 标量）
+    gain_mode: quadratic  # [test override]
+    k_coeffs: [                      # 仅 quadratic 模式使用，保留作对照；行 = [k_x, k_theta, k_x_dot, k_theta_dot]
+      0.0, 0.0, -1.18,
+      0.0, 0.0, -5.22,
+      0.0, 0.0, -1.17,
+      0.0, 0.0, -0.33
     ]
     # ---------------- 五杆足端 -> 质心高度：h = 足端_y + com_offset ----------------
     thigh: 0.15                      # [参考] 串联模型大腿长度 l1 [m]（URDF 无双连杆串联腿，主链路已改用五杆，仅单测用）
@@ -57,9 +69,10 @@ leg_control:
     # ---------------- Pitch 姿态来源 ----------------
     theta_axis: pitch                # 姿态轴：pitch / roll
     theta_offset: 0.0                # IMU 安装零位 [rad]：imu_site 与基座同向，静置 pitch ≈ 0
-    u_max: 0.40                    # 平衡力矩限幅 [N·m]：必须与 wheel_torque_max 一致（轮地摩擦上限 ≈0.4）。
-                                   #   写大了（如 1.0）LQR 会在 0.4~1.0 区间"假线性"，实际被
-                                   #   computeWheelTorques 截平 → 姿态变化看不出力矩响应
+    u_max: 0.40  # [test override]
+                                     #   固件电流能力 16000 counts ÷ 4500 = 3.56 N·m/轮（task.c），
+                                     #   1.0 N·m 无硬件压力；留 2/3 余量给差速与偏航。
+                                     #   两者不一致时 LQR 会在"假线性"区工作（输出被后端截平）。
 
     # ---------------- 五杆腿 VMC（两条腿共用几何，各自独立状态） ----------------
     l1: 0.050                        # O→A 前摆臂长度 [m]（URDF |lf_joint1→lf_joint2| = 0.0500，左右一致）
@@ -71,12 +84,16 @@ leg_control:
     front_branch: 1                  # 逆运动学前肘分支：+1 前肘 A 在 O→B 连线左侧，-1 取右侧
     rear_branch: 1                   # 逆运动学后肘分支：+1 后肘 C 在 D→B 连线右侧，-1 取左侧
 
-    kp_x: 70.0                       # 足端前后刚度 [N/m]
-    kp_y: 600.0                      # 足端上下刚度 [N/m]（撑住整机重量，同时别太硬把机身弹起来）
-    kd_x: 4.0                        # 足端前后阻尼 [N·s/m]
-    kd_y: 40.0                       # 足端上下阻尼 [N·s/m]
-    force_max_x: 40.0                # 足端前后力限幅 [N]，<=0 表示该轴不限
-    force_max_y: 150.0               # 足端上下力限幅 [N]，<=0 表示该轴不限
+    # kp/kd 按 ζ = kd / (2·√(kp·m_eq)) 配对（m_eq 取单腿等效质量 ≈ 0.56 kg）：
+    #   x 轴：kp=300 → kd=22 给 ζ≈0.85（kd=15 只有 0.58，欠阻尼、前后晃）
+    #   y 轴：kp=2500 → kd=70 给 ζ≈0.65（撑住整机重量，带宽 √(2kp_y/m)/2π ≈ 8 Hz）
+    kp_x: 70.0  # [test override]
+    kp_y: 600.0  # [test override]
+    kd_x: 4.0  # [test override]
+    kd_y: 40.0  # [test override]
+    force_max_x: 40.0  # [test override]
+    force_max_y: 150.0               # 足端上下力限幅 [N]：重力前馈 ~9.3 N + 弹簧量，余量充足
+    vmc_gravity_comp: false  # [test override]
     foot_target_x: 0.0314            # 足端前后目标位置 [m]（两髋中点 l5/2=0.03，按新零位实测 0.0314；y 由质心高度指令决定）
     joint_torque_max: 8.0            # 单关节力矩限幅 [N·m]
     joint_torque_sign: [1.0, 1.0, 1.0, 1.0]  # 四关节力矩符号 [左髋, 左膝, 右髋, 右膝]，方向反了改成 -1
@@ -100,9 +117,16 @@ leg_control:
     # 换算 h ∈ [0.017, 0.123]；再往上曲柄/连杆接近共线（奇异位形）。
     # home 姿态（关节全 0）是深蹲：foot_y = 0.0612、h = 0.0343；站立靠下面的指令把腿撑开。
     com_height_default: 0.0834       # 默认站立目标（换算 foot_y = 0.1123 m，实测 h≈0.067）
-    com_height_min: 0.065            # 足端目标 y=0.0988 m
-    com_height_max: 0.100            # 足端目标 y=0.1338 m（约 90% 行程），避开伸直奇异位形
-    com_height_rate: 0.30            # 目标质心高度变化率上限 [m/s]（避免阶跃）
+    # 上下限来自五杆工作空间（foot_x≈0.031 时 foot_y∈[0.046,0.152] → h∈[0.017,0.123]），
+    # 两端各留 ~10 mm 余量避开曲柄/连杆共线的奇异位形：
+    #   下限 0.065 → foot_y 0.0939；上限 0.100 → foot_y 0.1289（静止压缩 ~4 mm 后约 0.0965 实测）
+    com_height_min: 0.065            # 足端目标 y=0.0939 m（再往下腿折得太深，VMC 雅可比变差）
+    com_height_max: 0.100            # 足端目标 y=0.1289 m（约 90% 行程），避开伸直奇异位形
+    com_height_rate: 0.50            # 腿长指令斜坡 [m/s]，与三级频率匹配：
+                                     #   控制 500 Hz → 1.0 mm/周期；下发 200 Hz → 2.5 mm/帧；固件 250 Hz
+                                     #   全行程 0.065↔0.100 m（35 mm）用时 70 ms，跨越约 14 个下发帧，
+                                     #   不会出现"一帧跳变"，也不会慢到跟不上遥控节拍。
+                                     #   斜坡本身通过 VMC 足端速度前馈 (0, ±rate) 传给 kd_y，不再被阻尼拖住。
 
     # ---------------- 轮子速度分配（/wheel_target，仅供仿真与调试观测） ----------------
     # 固件 wheel_control_task 已是"纯力矩直通"（无位置/速度环，task.c 只读 wheel[].torque），
@@ -111,8 +135,10 @@ leg_control:
     #   差速分量 = (v_des ∓ 0.5·L·ω_des) / r，再各自夹到 max_drive_omega
     # 实机执行力矩见下面 wheel_torque_enable 段。
     max_linear_velocity: 1.0         # 车体线速度 v 限幅 [m/s]
-    max_yaw_rate: 3.0                # 车体偏航角速度 ω 限幅 [rad/s]
-                                     #   仿真 launch 覆盖成 0.20：原地偏航靠横向擦地，0.2 已接近摩擦极限（12.13）
+    max_yaw_rate: 1.0                # 车体偏航角速度 ω 限幅 [rad/s]：原地转向靠横向蹭地，
+                                     #   I_zz≈0.005~0.01 kg·m²，2 N·m 净力矩就是 200~400 rad/s²，
+                                     #   指令给太大只会打滑 + 陀螺噪声放大。1.0 rad/s 留够余量。
+                                     #   仿真 launch 覆盖成 0.20（12.13 实测已接近摩擦极限）
     wheel_separation: 0.305          # 轮距 L [m]（URDF 两轮 y = ±0.1525；按轮胎接地中心线量约 0.297）
     max_wheel_omega: 20.0            # 单轮角速度总限幅 [rad/s]（平衡 + 行驶）
     max_balance_omega: 8.0           # 平衡分量限幅 [rad/s]
@@ -128,12 +154,18 @@ leg_control:
     # 固件是纯力矩直通：帧里 wheel[i].torque × WHEEL_COUNTS_PER_NM → M2006 电流。
     # 关掉它 = 帧里 torque 恒 0 = 实机轮子完全不出力（腿能动、轮子不动）。
     wheel_torque_enable: true        # false = /wheel_torque 恒为 0；true = 力矩直通（实机必须 true）
-    wheel_torque_max: 0.40           # 单轮力矩限幅 [N·m]（≈轮地摩擦 μ·N·r）
+    wheel_torque_max: 0.40  # [test override]
+                                     #   取 1.0 让平衡（≤1.0）、差速、偏航三者共用同一预算。
+                                     #   原地转向突破力矩 ≈ μ·N·L/2 ≈ 0.6×22.5×0.153 ≈ 2.1 N·m，
+                                     #   左右反相 ±1.0 正好给出 2.0 N·m 差模，压在阈值上→必须靠积分补齐。
     k_vel_p: 1.0                     # 线速度误差 P [N·m per (m/s)]，左右同相：0.1 m/s 误差 → 0.1 N·m
-    k_yaw_p: 0.15                    # 偏航角速度误差 P [N·m per (rad/s)]，左右反相（力矩差转向）
-    yaw_ff: 0.06                     # 偏航角速度前馈 [N·m per rad/s]，左右差动力矩
+    k_yaw_p: 0.15  # [test override]
+                                     #   单轮 1.2 N·m、差模 2.4 N·m > 2.1 N·m 摩擦阈值，能真正转起来
+    yaw_ff: 0.06  # [test override]
+                                     #   单独 0.06 在 1 rad/s 时只有 1.2 N·m 差模 0.12，破不了静摩擦
     k_vel_i: 0.0                     # 线速度积分 [N·m per (m/s) per s]（补静摩擦死区），限幅 ±0.5·wheel_torque_max
-    k_yaw_i: 0.0                     # 偏航角速度积分 [N·m per (rad/s) per s]（同上）
+    k_yaw_i: 0.0  # [test override]
+                                     #   限幅 ±wheel_torque_max（差模 ±2.0 N·m）；代价是打滑时会 windup
     wheel_brake_damp: 0.02           # 非平衡态（未使能 / FAULT）阻尼制动 [N·m/(rad/s)]，τ = -k·ω
                                      #   固件没有位置环，锁不住轮子：坡上会缓慢溜车，想锁死要另加轮速闭环
 
@@ -169,7 +201,9 @@ command_param:
     command_topic: robot_command     # [话题] 上层指令发布的 ROS2 话题名称，底盘控制器将订阅此话题获取控制流
     publish_rate: 50.0               # [频率] 指令发布频率 [Hz]（50 Hz 既能保证指令平滑连续，又不会造成总线堵塞）
     max_linear: 1.0                  # [限幅] 车体最大线速度硬限幅 [m/s]，防止遥操作时速度给过大导致失控跑偏
-    max_yaw: 3.0                     # [限幅] 车体最大偏航角速度（转向速率）硬限幅 [rad/s]，限制原地旋转过猛
+    max_yaw: 1.0                     # [限幅] 车体最大偏航角速度（转向速率）硬限幅 [rad/s]：
+                                     #   与 leg_control 的 max_yaw_rate 保持一致；原地偏航靠横向蹭地，
+                                     #   指令超过 1 rad/s 只会打滑、让 gyro z 的反馈噪声放大
     com_height_min: 0.065            # [限幅] 质心高度安全下限 [m]，防止腿过分收缩导致机构产生机械干涉或触底
     com_height_max: 0.100            # [限幅] 质心高度安全上限 [m]，防止腿伸得太直逼近奇异位形（约 90% 行程）
     max_pitch_target: 0.30           # [限幅] 目标 Pitch 角最大绝对值 [rad]（约 11.5°），防止指令过大导致机器人倾覆
@@ -178,7 +212,9 @@ command_param:
     use_cmd_vel: true                # [开关] 是否订阅 cmd_vel；关掉就只能用 linear_velocity / yaw_rate 参数给速度
     cmd_vel_timeout: 0.5             # [安全] 超过该时间没有新 cmd_vel 就把速度归零 [s]，防止上层掉线后机器人继续跑
     max_linear_accel: 0.30           # [斜坡] 线速度指令跟踪加速度上限 [m/s²]；力矩型平衡环对速度阶跃很敏感，必须限加速
-    max_yaw_accel: 1.0               # [斜坡] 偏航角速度指令跟踪角加速度上限 [rad/s²]
+    max_yaw_accel: 3.0               # [斜坡] 偏航角速度指令跟踪角加速度上限 [rad/s²]：
+                                     #   原地转向的净力矩 2 N·m 对应 200~400 rad/s²，指令斜坡设 1.0
+                                     #   会让"想转"到"真转"拖 1 s；3.0 与执行能力同量级，50 Hz 发布下每帧 0.06 rad/s
 
     # =========================================================================
     # 第二部分：动态运行指令（支持通过 rqt_reconfigure / ros2 param set 实时动态修改）

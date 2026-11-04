@@ -10,7 +10,7 @@
         │                               → /wheel_torque (τ_L, τ_R)    500 Hz（实机主通道）
         │                               → /wheel_target (ω_L, ω_R)    仿真的速度环参考
         │
-    usb_drive/usb_drive_node            → USB-CDC → 下位机            200 Hz
+    usb_drive/usb_drive_node            → USB-CDC → 下位机            250 Hz
                                         ← RobotState_t → /odom + /joint_states
 
 层级职责：
@@ -58,7 +58,8 @@ def generate_launch_description():
     vid_arg = DeclareLaunchArgument('vid', default_value='1155', description='USB VID')
     pid_arg = DeclareLaunchArgument('pid', default_value='22336', description='USB PID')
     send_rate_arg = DeclareLaunchArgument(
-        'send_rate', default_value='200.0', description='下位机指令发送频率 [Hz]')
+        'send_rate', default_value='250.0',
+        description='下位机指令发送频率 [Hz]：500 Hz 控制环的整数分频，也与固件 250 Hz 对齐')
     wheel_torque_gain_arg = DeclareLaunchArgument(
         'wheel_torque_gain', default_value='1.0',
         description='/wheel_torque → 帧里 wheel[].torque 的缩放。固件是纯力矩直通，'

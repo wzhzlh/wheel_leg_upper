@@ -183,12 +183,13 @@ private:
     declare_parameter("kd_y", vmc.kd(1));
     declare_parameter("force_max_x", vmc.force_max(0));
     declare_parameter("force_max_y", vmc.force_max(1));
+    declare_parameter("vmc_gravity_comp", true);
     declare_parameter("foot_target_x", 0.03);
 
     declare_parameter("com_height_default", 0.085);
     declare_parameter("com_height_min", 0.065);
     declare_parameter("com_height_max", 0.100);
-    declare_parameter("com_height_rate", 0.30);
+    declare_parameter("com_height_rate", 0.50);
     declare_parameter("joint_torque_max", 8.0);
     declare_parameter("joint_torque_sign", std::vector<double>{1.0, 1.0, 1.0, 1.0});
     declare_parameter("joint_sign", std::vector<double>{1.0, 1.0, 1.0, 1.0});
@@ -200,19 +201,19 @@ private:
     declare_parameter("max_drive_omega", 12.0);
     declare_parameter("yaw_ff", 0.12);
     declare_parameter("k_vel_i", 0.0);
-    declare_parameter("k_yaw_i", 0.0);
+    declare_parameter("k_yaw_i", 0.60);
     declare_parameter("balance_torque_to_omega", 1.0);
     declare_parameter("balance_leak_rate", 6.0);
 
     // 轮子力矩通道（实机主通道，默认开；固件是纯力矩直通，关掉轮子就不出力）
     declare_parameter("wheel_torque_enable", true);
-    declare_parameter("wheel_torque_max", 0.40);
+    declare_parameter("wheel_torque_max", 1.00);
     declare_parameter("k_vel_p", 1.0);
-    declare_parameter("k_yaw_p", 0.15);
+    declare_parameter("k_yaw_p", 1.20);
     declare_parameter("wheel_brake_damp", 0.02);
 
     declare_parameter("max_linear_velocity", 1.0);
-    declare_parameter("max_yaw_rate", 3.0);
+    declare_parameter("max_yaw_rate", 1.0);
     declare_parameter("control_rate", 500.0);
     // 调试类输出（/odom + TF + /leg_control/state）的发布频率：控制环仍跑 control_rate，
     // 但这些话题 500 Hz 发布会把单线程 executor 和订阅端（rviz2/ros2 topic echo）拖垮，
@@ -320,6 +321,7 @@ private:
     if ((cfg.vmc.kp.array() < 0.0).any() || (cfg.vmc.kd.array() < 0.0).any()) {
       throw std::invalid_argument("kp / kd 不能为负");
     }
+    cfg.vmc_gravity_comp = get("vmc_gravity_comp").as_bool();
     cfg.foot_target_x = get("foot_target_x").as_double();
 
     cfg.com_height_default = get("com_height_default").as_double();
@@ -522,7 +524,8 @@ private:
       "thigh", "shank", "com_offset", "h_min", "h_max",
       "use_measured_height", "height_timeout",
       "l1", "l2", "l3", "l4", "l5", "foot_branch", "front_branch", "rear_branch",
-      "kp_x", "kp_y", "kd_x", "kd_y", "force_max_x", "force_max_y", "foot_target_x",
+      "kp_x", "kp_y", "kd_x", "kd_y", "force_max_x", "force_max_y", "vmc_gravity_comp",
+      "foot_target_x",
       "com_height_default", "com_height_min", "com_height_max", "com_height_rate",
       "joint_torque_max", "joint_torque_sign", "joint_sign", "joint_offset",
       "wheel_separation", "max_wheel_omega", "max_balance_omega", "max_drive_omega",

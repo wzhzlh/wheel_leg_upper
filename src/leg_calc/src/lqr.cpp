@@ -10,8 +10,10 @@ namespace leg_calc
 namespace
 {
 
-/// h 变化超过该阈值才重新求解 LQR（避免每周期都做特征分解）
-constexpr double kCacheTolerance = 1e-4;
+/// h 变化超过该阈值才重新求解 LQR（避免每周期都做特征分解）。
+/// 2 mm：实测 h 会在 ±1 mm 内抖动，1e-4 会让 500 Hz 控制环每周期都做 4×4 特征分解，
+/// 在 2 ms 周期里形成额外抖动；h 对 K 的影响本来就平缓（0.06→0.12 只变 ~3%）。
+constexpr double kCacheTolerance = 2e-3;
 
 }  // namespace
 

@@ -195,12 +195,13 @@ TEST(LegControlCore, FarTravelDoesNotSaturateBalanceTorque)
   const auto out = controller.step(tilted, 0.002);
   EXPECT_GT(std::abs(out.u), 0.5);         // 姿态变化必须真的改变 u（0.15×4.52≈0.68）
 
-  // 速度项同样必须零误差：LQR 不吃 ẋ，行驶由 computeWheelTorques 的 k_vel_p 负责。
-  // 旧代码 ref(kXdot)=v_des，k_x_dot=−2.0 会给正力矩继续加速（与 k_vel_p 打架）。
+  // 速度项：力矩通道下 LQR 的 x_dot 反馈是完整状态环的一部分，必须和 x_ref 位置项
+  // 配对使用（单独把 x/ẋ 误差清零会剩两个零极点，任何扰动都变成匀速漂移）。
+  // 单步看 ẋ>0 会给出正力矩，但这里只要求“不能因为 0.4 m/s 就饱和”。
   auto moving = far;
   moving.x_dot = 0.4;
   const auto roll = controller.step(moving, 0.002);
-  EXPECT_LE(roll.u, 0.0);                  // 前进时 LQR 不能继续加速
+  EXPECT_LT(std::abs(roll.u), cfg.u_max);   // 不应该仅因速度就顶到限幅
 }
 
 TEST(LegControlCore, LeftTurnMakesRightWheelMoreTorque)
@@ -460,12 +461,13 @@ TEST(LegControlCore, YawIntegralBuildsDifferentialTorque)
 
 TEST(LegControlCore, OnlineLqrSolvesAcrossHeightRange)
 {
-  // 部署用的是 online_lqr + q=[50,500,10,1] + R=36；节点启动时会对 h∈[h_min,h_max]
-  // 扫 11 个点做同样的稳定性校验，这里提前把它钉住，避免改 Q/R 后实机起不来。
+  // 部署用的是 online_lqr + q=[100,1050,10,6] + R=1.25（u 为总力矩语义，左右各 u/2）；
+  // 节点启动时会对 h∈[h_min,h_max] 扫 11 个点做同样的稳定性校验，这里提前钉住，
+  // 避免改 Q/R 后实机起不来。
   auto cfg = makeConfig();
   cfg.gain_mode = leg_calc::GainMode::kOnlineLqr;
-  cfg.Q = Eigen::Vector4d(50.0, 500.0, 10.0, 1.0).asDiagonal();
-  cfg.R = Eigen::MatrixXd::Constant(1, 1, 36.0);
+  cfg.Q = Eigen::Vector4d(100.0, 1050.0, 10.0, 6.0).asDiagonal();
+  cfg.R = Eigen::MatrixXd::Constant(1, 1, 1.25);
   cfg.h_min = 0.06;
   cfg.h_max = 0.12;
 
@@ -478,8 +480,9 @@ TEST(LegControlCore, OnlineLqrSolvesAcrossHeightRange)
     const auto g = gains.gainAt(h);
     EXPECT_TRUE(gains.lastSolveOk()) << "h=" << h;
     EXPECT_TRUE(g.allFinite()) << "h=" << h;
-    // k_theta 必须为负（前倾 → 正力矩）且幅值足够撑住倒立摆，又不能 1° 就打到 u_max
+    // k_theta 必须为负（前倾 → 正力矩）且幅值足够撑住倒立摆；
+    // 上限按“总力矩”语义放宽（K 是每轮的两倍，u_max=0.80 时饱和角 ≈1.2°）
     EXPECT_LT(g(0, 1), -1.0) << "h=" << h;
-    EXPECT_GT(g(0, 1), -15.0) << "h=" << h;
+    EXPECT_GT(g(0, 1), -45.0) << "h=" << h;
   }
 }

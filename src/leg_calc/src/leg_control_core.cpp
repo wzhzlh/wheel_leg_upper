@@ -46,6 +46,7 @@ void LegController::reset()
   yaw_rate_filt_ = 0.0;
   vel_i_ = 0.0;
   yaw_i_ = 0.0;
+  x_ref_valid_ = false;
 }
 
 ControlOutput LegController::step(const StateSnapshot & snapshot, double dt)
@@ -79,6 +80,7 @@ ControlOutput LegController::step(const StateSnapshot & snapshot, double dt)
 
   if (status.balance_enabled) {
     updateComHeightTarget(snapshot.command, dt);
+    updatePositionReference(snapshot, status, dt);
     out.u = computeBalanceTorque(snapshot, gain, status.command_fresh);
     out.joint_torque = computeJointTorques(snapshot);
     // 下位机运控模式要的“位置目标”：由足端目标 IK 得到，kp/kd 非 0 时才真正起作用
@@ -100,6 +102,7 @@ ControlOutput LegController::step(const StateSnapshot & snapshot, double dt)
     balance_omega_state_ = {{0.0, 0.0}};
     vel_i_ = 0.0;
     yaw_i_ = 0.0;
+    x_ref_valid_ = false;   // 退出平衡后重新锚定位置参考
     if (config_.wheel_torque_enable) {
       for (size_t i = 0; i < 2; ++i) {
         out.wheel_torque_ref[i] = std::clamp(
@@ -130,6 +133,26 @@ void LegController::updateComHeightTarget(const RobotCommand & command, double d
   // 腿长指令的实际变化率 [m/s]（正 = 腿在伸长）：作为 VMC 的足端速度前馈。
   // 指令已到位的稳态下它恒为 0，不会影响站立刚性。
   com_height_vel_ = (dt > 0.0) ? (com_height_cmd_ - prev_cmd) / dt : 0.0;
+}
+
+void LegController::updatePositionReference(
+  const StateSnapshot & snapshot, const SafetyStatus & status, double dt)
+{
+  if (!x_ref_valid_) {
+    x_ref_ = snapshot.x;   // 首次进入平衡：以当前轮端位置为基准
+    x_ref_valid_ = true;
+  }
+  const bool tracking = (status.state == ControlState::kRun) && status.command_fresh;
+  const double v_des = tracking ? std::clamp(
+    snapshot.command.linear_velocity,
+    -config_.max_linear_velocity, config_.max_linear_velocity) : 0.0;
+  // 行驶时参考位置按指令速度积分（不是跟随实测）：位置误差 = 跟踪滞后，
+  // 完整 LQR 的 x/ẋ 两项一起把速度收敛到 v_des。若直接跟随实测，位置项恒 0，
+  // 只剩 k_x_dot 一项 —— 它和位置项配对时才稳定，单独工作会变成正反馈（实测 0.1 指令冲到 0.4 m/s）。
+  // 停车后参考冻结，位置误差把残余溜车刹住（x 是绝对轮端转角，不能锚在 0）。
+  if (std::abs(v_des) > 1e-3) {
+    x_ref_ += v_des * std::max(0.0, dt);
+  }
 }
 
 Eigen::Vector2d LegController::legJointAngles(const StateSnapshot & snapshot, int leg) const
@@ -173,16 +196,19 @@ double LegController::computeBalanceTorque(
   state << snapshot.x, snapshot.pitch, snapshot.x_dot, snapshot.pitch_rate;
   WheelLegModel::State ref = WheelLegModel::State::Zero();
   ref(kTheta) = snapshot.command.pitch_target;
-  // LQR 只负责姿态（θ、θ̇）：位置/速度误差一律跟随实测值，误差恒零。
-  //   * snapshot.x 是轮子多圈绝对转角×r（没有起点锚定）：当作位置误差时，
-  //     轮子转出几米后 k_x·(x−x_ref) 就顶到 ±u_max，姿态项被淹没（实测 x=-27 m 时
-  //     位置项 31.8、姿态项 0.07 → "轮子在转但摆动机身毫无反应"）。
-  //   * 速度跟踪交给 computeWheelTorques 的 k_vel_p / k_yaw_p。LQR 里再吃
-  //     k_x_dot·(v_des−ẋ) 就是两级速度环，而且符号相反（k_x_dot=−2.0 给正力矩、
-  //     k_vel_p=+1.0 给负力矩）：实测 ẋ=0.36 m/s 时 u 恒贴 0.4 上限、轮子自走。
-  ref(kX) = snapshot.x;
-  ref(kXdot) = snapshot.x_dot;
-  (void)command_fresh;
+  // 位置项：行驶时 x_ref 按指令速度积分；停车后冻结在最后一次参考位置，
+  // 让 LQR 的 x 项把残余溜车刹住（Snapshot.x 是轮子多圈绝对转角×r，不能直接锚在 0）。
+  ref(kX) = config_.wheel_torque_enable && x_ref_valid_ ? x_ref_ : snapshot.x;
+  // 速度项必须保留：k_x_dot<0 时它和 θ/θ̇ 项一起把"车体速度"极点拉成稳定
+  // （线性化 A−B·K 在去掉 x_dot 反馈后有两个零极点，任何扰动都会变成匀速漂移）。
+  // 只有力矩通道（实机/仿真主通道）才由 LQR 做速度参考；速度通道交给 /wheel_target 差速。
+  if (config_.wheel_torque_enable) {
+    ref(kXdot) = command_fresh ? std::clamp(
+      snapshot.command.linear_velocity,
+      -config_.max_linear_velocity, config_.max_linear_velocity) : 0.0;
+  } else {
+    ref(kXdot) = snapshot.x_dot;
+  }
 
   const double u = -(gain * (state - ref))(0, 0);
   return std::clamp(u, -config_.u_max, config_.u_max);
@@ -312,8 +338,11 @@ std::array<double, 2> LegController::computeWheelSpeeds(
 std::array<double, 2> LegController::computeWheelTorques(
   const SafetyStatus & status, const StateSnapshot & snapshot, double u, double dt)
 {
-  // 平衡分量：LQR 已限幅到 ±u_max，左右同值（正 = 往前推）
-  std::array<double, 2> tau_ref{{u, u}};
+  // LQR 的 u 是**总轮轴力矩**（模型 inputMatrix 的 Bq = 1/r，即 u 产生的纵向广义力是 u/r），
+  // 左右对称各分一半：τ_L0 = τ_R0 = u/2，两轮合力矩 = u，与模型一致。
+  // u_max 因此也按“总力矩”理解（每轮实际 = u/2 ≤ u_max/2 ≤ wheel_torque_max）。
+  // 下面叠加的速度项 / 偏航项按“每轮”定义（k_vel_p、k_yaw_p 是单轮系数），不再分半。
+  std::array<double, 2> tau_ref{{0.5 * u, 0.5 * u}};
 
   // 只有 RUN 且命令新鲜时才跟踪速度/偏航；其它状态目标归零，P 项自然退化成阻尼
   const bool tracking = (status.state == ControlState::kRun) && status.command_fresh;

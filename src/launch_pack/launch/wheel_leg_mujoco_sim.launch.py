@@ -178,14 +178,30 @@ def generate_launch_description():
         output="screen",
         condition=IfCondition(LaunchConfiguration("use_control")),
         # 行驶由 LQR 的速度参考负责（仿真桥把 /wheel_target 当力矩用，力矩通道只有实机走）
-        # max_yaw_rate 降到 0.2：原地偏航靠横向擦地，仿真实测 0.2 rad/s 已接近摩擦极限
-        # （0.3 会擦滑把俯仰顶翻）；限幅后超范围的指令只会饱和，不会倒地
+        # max_yaw_rate 降到 0.10：原地偏航靠横向擦地，实测 0.10 rad/s 能稳定跟踪
+        # （上层给 0.20 时实际只到 ~0.1，再往上就脱粘擦滑、把俯仰顶翻）。
+        # 限幅后超范围的指令只会饱和，不会倒地
         # 仿真走力矩通道：leg_control 把 LQR u / 速度 P / 偏航力矩直接发到 /wheel_torque，
         # sim_bridge 以 N·m 下发（速度通道的 20·u rad/s 在 torque 模式会被当成 20 倍力矩）。
-        # k_vel_p 必须给 0：LQR 的 k_x_dot=-2.0 已经在做速度反馈，再叠一层 -1.0·ẋ
-        # 等效 k_x_dot=3.0，超过 12.13 量到的稳定上限 2.1，会变成 ±2 rad/s 的极限环
-        parameters=[leg_params, {"startup_cycles": 100, "max_yaw_rate": 0.20,
-                                 "wheel_torque_enable": True, "k_vel_p": 0.0}],
+        # k_vel_p 必须给 0：速度由 LQR 的 k_x_dot 反馈负责，再叠一层会把速度极点推成不稳定
+        # 仿真机的控制线程没有 CAP_SYS_NICE：SCHED_FIFO/nice 必然失败，只会刷一条 WARN；
+        # IDE/浏览器抢时间片时控制环最长会被拖 60+ ms，0.10 s 的传感器超时会误判成
+        # kFaultImu/kFaultJointState 而停机（实测组合测试里出现过一次 0x01）。
+        # 仿真里放宽到 0.25 s（实机仍用 yaml 的 0.10 s，下位机有独立 RT 线程）。
+        parameters=[leg_params, {
+            "startup_cycles": 100,
+            "max_yaw_rate": 0.10,
+            "wheel_torque_enable": True,
+            "k_vel_p": 0.0,
+            # 力矩通道下已验证的线速度上限 0.10 m/s（再高会超调/擦滑），
+            # 超范围指令只会饱和，不会把机器人冲出去
+            "max_linear_velocity": 0.10,
+            "imu_timeout": 0.25,
+            "joint_state_timeout": 0.25,
+            "wheel_state_timeout": 0.25,
+            "rt_priority": 0,
+            "rt_nice": 0,
+        }],
     )
 
     # 仿真 I/O 桥：补 IMU 姿态，并把 joint_target / wheel_target 翻译成

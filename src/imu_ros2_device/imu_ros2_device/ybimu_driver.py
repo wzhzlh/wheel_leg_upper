@@ -24,9 +24,14 @@ class YbImuDriver(Node):
         self.declare_parameter("frame_id", "imu_link")
         self.declare_parameter("topic", "imu/data")
         self.declare_parameter("publish_rate", 100.0)
+        # IMU 内部上报率（库限制 10~100 Hz）。默认值往往只有 5~10 Hz，
+        # 而驱动按 publish_rate 反复发布同一份缓存 → 表现为"100 Hz 的话题、5 Hz 的新数据"，
+        # 姿态环会有 100~200 ms 纯延迟（"刚度够但修正慢"的主因）。
+        self.declare_parameter("report_rate", 100.0)
         self.declare_parameter("orientation_stddev", 0.01)
 
         self.robot = None
+        self._gyro_zero_frames = 0
         self.frame_id = self.get_parameter("frame_id").value
         self.orientation_stddev = float(
             self.get_parameter("orientation_stddev").value)
@@ -60,6 +65,14 @@ class YbImuDriver(Node):
                 self.get_logger().debug(f"打开 {candidate} 失败: {exc}")
                 continue
             self.robot.create_receive_threading()
+            # 把模块内部上报率拉到最大（库内部 clamp 10~100 Hz，调用会阻塞约 1 s）
+            try:
+                rate = int(max(10.0, min(100.0, float(
+                    self.get_parameter("report_rate").value))))
+                self.robot.set_report_rate(rate)
+                self.get_logger().info(f"IMU 上报率已设为 {rate} Hz")
+            except Exception as exc:  # noqa: BLE001 - 设置失败不影响取数
+                self.get_logger().warn(f"设置 IMU 上报率失败: {exc}")
             self.get_logger().info(f"IMU 串口已打开: {candidate}")
             return
 
@@ -88,6 +101,16 @@ class YbImuDriver(Node):
         imu.angular_velocity.x = float(gx)
         imu.angular_velocity.y = float(gy)
         imu.angular_velocity.z = float(gz)
+
+        # 陀螺仪健康检查：加速度有值但三轴角速度连续为 0，说明模块没在输出陀螺数据。
+        # 此时 θ̇ 阻尼项与偏航闭环全部失效（表现为"刚度够但修正慢"）。
+        if gx == 0.0 and gy == 0.0 and gz == 0.0:
+            self._gyro_zero_frames += 1
+            if self._gyro_zero_frames == 300:   # ≈3 s @100 Hz
+                self.get_logger().warn(
+                    "IMU 角速度连续为 0：陀螺仪未输出数据，θ̇ 阻尼与偏航闭环会失效")
+        else:
+            self._gyro_zero_frames = 0
 
         variance = self.orientation_stddev ** 2
         imu.orientation.w = float(qw)

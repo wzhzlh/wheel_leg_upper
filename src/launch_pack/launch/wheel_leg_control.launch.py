@@ -40,7 +40,9 @@ def generate_launch_description():
     imu_frame_arg = DeclareLaunchArgument(
         'imu_frame_id', default_value='imu_link', description='IMU 坐标系名')
     imu_rate_arg = DeclareLaunchArgument(
-        'imu_rate', default_value='200.0', description='IMU 发布频率 [Hz]')
+        'imu_rate', default_value='100.0',
+        description='IMU 发布频率 [Hz]：YbImu 硬件上报率上限就是 100 Hz，'
+                    '设更高只是重复发布同一份缓存（会让姿态环多出纯延迟）')
 
     control_params_arg = DeclareLaunchArgument(
         'control_params_file',
@@ -75,6 +77,7 @@ def generate_launch_description():
             'port': LaunchConfiguration('port'),
             'frame_id': LaunchConfiguration('imu_frame_id'),
             'publish_rate': ParameterValue(LaunchConfiguration('imu_rate'), value_type=float),
+            'report_rate': ParameterValue(LaunchConfiguration('imu_rate'), value_type=float),
         }],
     )
 

@@ -42,6 +42,9 @@ public:
 
 private:
   void updateComHeightTarget(const RobotCommand & command, double dt);
+  /// 速度/位置参考：首次使能锚定，行驶时按指令速度积分，停车后冻结
+  void updatePositionReference(
+    const StateSnapshot & snapshot, const SafetyStatus & status, double dt);
   double computeComHeight(const StateSnapshot & snapshot) const;
   /// 原始关节角 → 五杆角 q = [α, β]（按 joint_sign / joint_offset 标定）
   Eigen::Vector2d legJointAngles(const StateSnapshot & snapshot, int leg) const;
@@ -70,6 +73,9 @@ private:
   double com_height_{0.30};
   /// 腿长指令的实际变化率 [m/s]（正 = 伸长）：VMC 足端速度前馈用
   double com_height_vel_{0.0};
+  /// 轮端位置参考 [m]（只在力矩通道用）：首次使能时锚定，行驶时按指令速度积分，停车后冻结
+  double x_ref_{0.0};
+  bool x_ref_valid_{false};
   /// 偏航角速度反馈的低通值 [rad/s]（IMU 角速度 200 Hz 更新，直接进 P 会抖）
   double yaw_rate_filt_{0.0};
   /// 力矩前馈模式（wheel_torque_enable=true）的速度/偏航积分微调量（N·m）

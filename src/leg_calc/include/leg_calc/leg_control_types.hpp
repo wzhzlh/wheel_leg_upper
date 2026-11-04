@@ -68,15 +68,16 @@ struct ControllerConfig
   double max_balance_omega{8.0};        ///< 平衡分量限幅 [rad/s]
   double max_drive_omega{12.0};         ///< 行驶 / 转向分量限幅 [rad/s]
   /// LQR 力矩型输出 → 轮速目标的折算系数 [rad/s per N·m]：
-  /// 固件轮子是"位置外环 + 速度内环"的双环 PID，只能接速度目标，故在此折算
+  /// 只在仿真（sim_bridge 用 /wheel_target 做速度环）里有意义，实机固件不读速度
   double balance_torque_to_omega{1.0};
   double balance_leak_rate{6.0};        ///< 平衡轮速指令一阶低通系数 [1/s]，越大跟随越快
 
-  // --------- 轮子力矩前馈通道（可选，默认关闭） ---------
-  // 固件已恢复 PID 双环：主通道是 /wheel_target（速度），力矩只是叠加在速度环输出上的前馈。
-  /// 总开关：false = 力矩前馈恒为 0（默认）；true = 额外下发 LQR + 速度/偏航误差 P
-  bool wheel_torque_enable{false};
-  /// 单轮力矩前馈限幅 [N·m]（≈轮地摩擦上限 μ·N·r）
+  // --------- 轮子力矩通道（实机主通道，默认开启） ---------
+  // 固件是纯力矩直通：帧里 wheel[].torque × WHEEL_COUNTS_PER_NM → M2006 电流。
+  /// 总开关：true = 下发 LQR + 速度/偏航误差 P 合成的轮子力矩（默认）；
+  ///         false = 轮子力矩恒为 0，实机轮子完全不出力
+  bool wheel_torque_enable{true};
+  /// 单轮力矩限幅 [N·m]（≈轮地摩擦上限 μ·N·r）
   double wheel_torque_max{0.40};
   /// 偏航角速度前馈 [N·m per rad/s]：力矩前馈模式下给左右反相的差动量
   double yaw_ff{0.12};
@@ -88,8 +89,8 @@ struct ControllerConfig
   double k_yaw_p{0.15};
   /// 偏航角速度积分增益 [N·m / (rad/s) / s]
   double k_yaw_i{0.0};
-  /// 非平衡态（未使能 / FAULT）的阻尼制动 [N·m per (rad/s)]，仅力矩前馈模式使用；
-  /// 速度通道下非平衡态直接给 ω_ref = 0，由固件位置环锁住轮子
+  /// 非平衡态（未使能 / FAULT）的阻尼制动 [N·m per (rad/s)]，τ = -k·ω；
+  /// 固件没有位置环，锁不住轮子（坡上会溜车，要锁死得另加轮速闭环）
   double wheel_brake_damp{0.02};
 
   SafetyLimits safety;

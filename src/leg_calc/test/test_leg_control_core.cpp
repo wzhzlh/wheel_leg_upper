@@ -142,7 +142,7 @@ TEST(LegControlCore, StraightDriveMakesBothWheelsSameDirection)
 TEST(LegControlCore, WheelTorqueIsBalancePlusVelocityP)
 {
   auto cfg = makeConfig();
-  cfg.wheel_torque_enable = true;   // 力矩前馈是可选项，默认关
+  cfg.wheel_torque_enable = true;   // 实机主通道（固件纯力矩直通）
   cfg.k_vel_p = 1.0;
   leg_calc::LegController controller(cfg);
   const auto out = runUntil(controller, makeSnapshot(true, 0.3, 0.0), leg_calc::ControlState::kRun);
@@ -155,15 +155,52 @@ TEST(LegControlCore, WheelTorqueIsBalancePlusVelocityP)
   }
 }
 
-TEST(LegControlCore, WheelTorqueDisabledByDefault)
+TEST(LegControlCore, WheelTorqueDisabledWhenSwitchedOff)
 {
-  // 固件已恢复 PID 双环：主通道是 /wheel_target，力矩前馈默认必须恒为 0
-  leg_calc::LegController controller(makeConfig());
+  // 力矩通道默认开（固件纯力矩直通，实机执行就靠它）；显式关掉后必须恒为 0
+  auto cfg = makeConfig();
+  EXPECT_TRUE(cfg.wheel_torque_enable);
+  cfg.wheel_torque_enable = false;
+  leg_calc::LegController controller(cfg);
   const auto out = runUntil(controller, makeSnapshot(true, 0.3, 0.5), leg_calc::ControlState::kRun);
 
   for (double tau : out.wheel_torque_ref) {
     EXPECT_DOUBLE_EQ(tau, 0.0);
   }
+}
+
+TEST(LegControlCore, FarTravelDoesNotSaturateBalanceTorque)
+{
+  // 轮端 x 是轮子多圈绝对转角×r（无起点锚定）：跑出几十米后位置项不能把 u 顶到 u_max，
+  // 否则姿态项被淹没 —— 现象就是“轮子在转，但摆动机身完全没有反应”。
+  auto cfg = makeConfig();
+  cfg.wheel_torque_enable = true;
+  cfg.u_max = 1.0;
+  cfg.k_coeffs << 0.0, 0.0, -1.18,
+    0.0, 0.0, -4.52,
+    0.0, 0.0, -2.00,
+    0.0, 0.0, -0.28;
+  leg_calc::LegController controller(cfg);
+
+  auto far = makeSnapshot(true, 0.0, 0.0);
+  far.x = -27.0;          // 已经滚了 27 m
+  far.x_dot = 0.0;
+  far.pitch = 0.0;
+  far.pitch_rate = 0.0;
+  const auto level = runUntil(controller, far, leg_calc::ControlState::kRun);
+  EXPECT_LT(std::abs(level.u), 0.05);      // 平放：位置项零误差，不该出力
+
+  auto tilted = far;
+  tilted.pitch = 0.15;
+  const auto out = controller.step(tilted, 0.002);
+  EXPECT_GT(std::abs(out.u), 0.5);         // 姿态变化必须真的改变 u（0.15×4.52≈0.68）
+
+  // 速度项同样必须零误差：LQR 不吃 ẋ，行驶由 computeWheelTorques 的 k_vel_p 负责。
+  // 旧代码 ref(kXdot)=v_des，k_x_dot=−2.0 会给正力矩继续加速（与 k_vel_p 打架）。
+  auto moving = far;
+  moving.x_dot = 0.4;
+  const auto roll = controller.step(moving, 0.002);
+  EXPECT_LE(roll.u, 0.0);                  // 前进时 LQR 不能继续加速
 }
 
 TEST(LegControlCore, LeftTurnMakesRightWheelMoreTorque)

@@ -7,7 +7,8 @@
         │
     leg_calc/leg_control_node           /imu/data + /joint_states + /robot_command
         │                               → /joint_target (effort=τ)
-        │                               → /wheel_target (ω_L, ω_R)    500 Hz
+        │                               → /wheel_torque (τ_L, τ_R)    500 Hz（实机主通道）
+        │                               → /wheel_target (ω_L, ω_R)    仿真的速度环参考
         │
     usb_drive/usb_drive_node            → USB-CDC → 下位机            200 Hz
                                         ← RobotState_t → /odom + /joint_states
@@ -59,9 +60,9 @@ def generate_launch_description():
     send_rate_arg = DeclareLaunchArgument(
         'send_rate', default_value='200.0', description='下位机指令发送频率 [Hz]')
     wheel_torque_gain_arg = DeclareLaunchArgument(
-        'wheel_torque_gain', default_value='0.0',
-        description='/wheel_torque → 帧里 wheel[].torque 的缩放（0 = 用力矩前馈；'
-                    '固件已恢复 PID 双环，执行主通道是 /wheel_target）')
+        'wheel_torque_gain', default_value='1.0',
+        description='/wheel_torque → 帧里 wheel[].torque 的缩放。固件是纯力矩直通，'
+                    '这是实机唯一的轮子执行通道，默认 1.0（0 = 轮子完全不出力）')
 
     imu_driver = Node(
         package='imu_ros2_device',
@@ -104,8 +105,8 @@ def generate_launch_description():
             'vid': ParameterValue(LaunchConfiguration('vid'), value_type=int),
             'pid': ParameterValue(LaunchConfiguration('pid'), value_type=int),
             'send_rate': ParameterValue(LaunchConfiguration('send_rate'), value_type=float),
-            # 固件是位置+速度双环，实机执行通道是 /wheel_target；
-            # torque 只是叠加在速度环输出上的前馈，默认 0（关）
+            # 固件是纯力矩直通，实机执行通道就是帧里的 wheel[].torque；
+            # 默认 1.0，置 0 等于轮子完全不出力
             'wheel_torque_gain': ParameterValue(
                 LaunchConfiguration('wheel_torque_gain'), value_type=float),
         }],

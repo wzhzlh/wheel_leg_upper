@@ -42,9 +42,6 @@ public:
 
 private:
   void updateComHeightTarget(const RobotCommand & command, double dt);
-  /// 速度指令下的位置参考：行驶时跟随当前位置，停车后缓慢收回原点
-  void updatePositionReference(
-    const StateSnapshot & snapshot, const SafetyStatus & status, double dt);
   double computeComHeight(const StateSnapshot & snapshot) const;
   /// 原始关节角 → 五杆角 q = [α, β]（按 joint_sign / joint_offset 标定）
   Eigen::Vector2d legJointAngles(const StateSnapshot & snapshot, int leg) const;
@@ -71,8 +68,6 @@ private:
   /// 力矩前馈通道的一阶低通状态 [N·m]：500 Hz 直通会激励腿部/俯仰谐振
   std::array<double, 2> wheel_torque_state_{{0.0, 0.0}};
   double com_height_{0.30};
-  /// 位置参考 x_ref（LQR 的 x 状态目标）：行驶时=当前 x，停车后原地冻结
-  double x_ref_{0.0};
   /// 偏航角速度反馈的低通值 [rad/s]（IMU 角速度 200 Hz 更新，直接进 P 会抖）
   double yaw_rate_filt_{0.0};
   /// 力矩前馈模式（wheel_torque_enable=true）的速度/偏航积分微调量（N·m）

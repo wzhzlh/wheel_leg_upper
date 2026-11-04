@@ -57,7 +57,9 @@ leg_control:
     # ---------------- Pitch 姿态来源 ----------------
     theta_axis: pitch                # 姿态轴：pitch / roll
     theta_offset: 0.0                # IMU 安装零位 [rad]：imu_site 与基座同向，静置 pitch ≈ 0
-    u_max: 1.0                     # 平衡力矩限幅 [N·m]（轮地摩擦上限约 μ·N·r≈0.4，超出就滑移、里程计失真）
+    u_max: 0.40                    # 平衡力矩限幅 [N·m]：必须与 wheel_torque_max 一致（轮地摩擦上限 ≈0.4）。
+                                   #   写大了（如 1.0）LQR 会在 0.4~1.0 区间"假线性"，实际被
+                                   #   computeWheelTorques 截平 → 姿态变化看不出力矩响应
 
     # ---------------- 五杆腿 VMC（两条腿共用几何，各自独立状态） ----------------
     l1: 0.050                        # O→A 前摆臂长度 [m]（URDF |lf_joint1→lf_joint2| = 0.0500，左右一致）
@@ -102,11 +104,12 @@ leg_control:
     com_height_max: 0.100            # 足端目标 y=0.1338 m（约 90% 行程），避开伸直奇异位形
     com_height_rate: 0.30            # 目标质心高度变化率上限 [m/s]（避免阶跃）
 
-    # ---------------- 轮子控制与分配（实机主通道 = /wheel_target 速度） ----------------
-    # 固件 wheel_control_task 是"位置外环 + 速度内环"的双环 PID，只接速度目标：
-    #   ω_ref = clamp(平衡分量 + 差速行驶分量)  →  固件位置环把它积分成角度目标并锁定
+    # ---------------- 轮子速度分配（/wheel_target，仅供仿真与调试观测） ----------------
+    # 固件 wheel_control_task 已是"纯力矩直通"（无位置/速度环，task.c 只读 wheel[].torque），
+    # 所以 /wheel_target 的 ω 在实机上不参与执行，只有 sim_bridge 还拿它做速度环参考。
     #   平衡分量 = LQR 力矩 u × balance_torque_to_omega（一阶漏积分平滑）
     #   差速分量 = (v_des ∓ 0.5·L·ω_des) / r，再各自夹到 max_drive_omega
+    # 实机执行力矩见下面 wheel_torque_enable 段。
     max_linear_velocity: 1.0         # 车体线速度 v 限幅 [m/s]
     max_yaw_rate: 3.0                # 车体偏航角速度 ω 限幅 [rad/s]
                                      #   仿真 launch 覆盖成 0.20：原地偏航靠横向擦地，0.2 已接近摩擦极限（12.13）
@@ -117,23 +120,22 @@ leg_control:
                                      #   max_wheel_omega 约束）。12 rad/s × r=0.030 ≈ 0.36 m/s，
                                      #   想跑更快就同时加大 max_linear_velocity 与这一项
     # LQR 的力矩型输出 → 轮速目标的折算系数 [rad/s per N·m]：
-    # 固件只能接速度，所以平衡力矩在这里折算成轮速；放大系数越大平衡越"猛"，需实机标定
+    # 只在仿真（sim_bridge 用 /wheel_target 做速度环）里有意义，实机不生效
     balance_torque_to_omega: 20.0
     balance_leak_rate: 60.0          # 平衡轮速指令一阶低通系数 [1/s]（越大跟随越快，越小越柔）
 
-    # ---------------- 轮子力矩前馈通道（可选，默认关） ----------------
-    # 固件把帧里的 torque 当**前馈**加到速度环输出上（task.c: wheel_velocity_pid.pid_out
-    # + torque·WHEEL_COUNTS_PER_NM，再统一限幅）。主通道仍是 /wheel_target，
-    # 这里打开等于在速度环之上再叠一层力矩，容易和位置环互相顶，默认关。
-    wheel_torque_enable: false       # false = /wheel_torque 恒为 0；true = 启用下面的前馈
-    wheel_torque_max: 0.40           # 单轮力矩前馈限幅 [N·m]（≈轮地摩擦 μ·N·r）
+    # ---------------- 轮子力矩通道（实机主通道，必须开） ----------------
+    # 固件是纯力矩直通：帧里 wheel[i].torque × WHEEL_COUNTS_PER_NM → M2006 电流。
+    # 关掉它 = 帧里 torque 恒 0 = 实机轮子完全不出力（腿能动、轮子不动）。
+    wheel_torque_enable: true        # false = /wheel_torque 恒为 0；true = 力矩直通（实机必须 true）
+    wheel_torque_max: 0.40           # 单轮力矩限幅 [N·m]（≈轮地摩擦 μ·N·r）
     k_vel_p: 1.0                     # 线速度误差 P [N·m per (m/s)]，左右同相：0.1 m/s 误差 → 0.1 N·m
     k_yaw_p: 0.15                    # 偏航角速度误差 P [N·m per (rad/s)]，左右反相（力矩差转向）
     yaw_ff: 0.06                     # 偏航角速度前馈 [N·m per rad/s]，左右差动力矩
     k_vel_i: 0.0                     # 线速度积分 [N·m per (m/s) per s]（补静摩擦死区），限幅 ±0.5·wheel_torque_max
     k_yaw_i: 0.0                     # 偏航角速度积分 [N·m per (rad/s) per s]（同上）
-    wheel_brake_damp: 0.02           # 仅力矩前馈模式：非平衡态（未使能 / FAULT）阻尼制动 [N·m/(rad/s)]
-                                     #   速度通道下非平衡态直接给 ω_ref = 0，由固件位置环锁住
+    wheel_brake_damp: 0.02           # 非平衡态（未使能 / FAULT）阻尼制动 [N·m/(rad/s)]，τ = -k·ω
+                                     #   固件没有位置环，锁不住轮子：坡上会缓慢溜车，想锁死要另加轮速闭环
 
     # ---------------- 安全门限（状态机见 control_state.hpp） ----------------
     imu_timeout: 0.10                # IMU 数据年龄上限 [s]，超过置 kFaultImu

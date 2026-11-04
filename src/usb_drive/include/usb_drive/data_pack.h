@@ -29,14 +29,13 @@ typedef struct
 } Wheel_t;
 
 /// 轮子目标（上位机 -> 下位机）
-/// 下位机是"位置外环 + 速度内环"的双环 PID（task.c wheel_control_task）：
-///   vel_ref = pos_pid(angle, angle_target).out + WHEEL_OMEGA_FF_GAIN(=1.0) * omega
-///   current = vel_pid(omega, vel_ref).out + torque * 4500 counts/(N*m)
+/// 下位机是**纯力矩直通**（task.c wheel_control_task，没有位置/速度环）：
+///   current = clamp(torque * WHEEL_COUNTS_PER_NM(4500), ±16000)，angle/omega 不参与
 typedef struct
 {
-  float angle;   ///< 位置环目标 [rad]（上位机按 omega 积分得到；固件夹到实测角 ±0.5 rad）
-  float omega;   ///< 速度环参考 + 全量前馈 [rad/s]（正 = 前进）
-  float torque;  ///< 力矩前馈 [N*m]（叠加在速度环输出上，默认 0 = 关闭）
+  float angle;   ///< 保留字段 [rad]（上位机按 omega 积分填，固件不读）
+  float omega;   ///< 保留字段 [rad/s]（/wheel_target，固件不读；仅仿真桥使用）
+  float torque;  ///< 力矩指令 [N*m]（实机主通道；0 = 轮子不出力）
 } WheelTarget_t;
 
 /// 关节目标（RobStride 运动控制：τ = kp*(angle-θ) + kd*(omega-ω) + torque）

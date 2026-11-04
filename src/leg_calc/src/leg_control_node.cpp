@@ -204,8 +204,8 @@ private:
     declare_parameter("balance_torque_to_omega", 1.0);
     declare_parameter("balance_leak_rate", 6.0);
 
-    // 轮子力矩前馈通道（可选，默认关；固件 PID 双环之上再叠加力矩）
-    declare_parameter("wheel_torque_enable", false);
+    // 轮子力矩通道（实机主通道，默认开；固件是纯力矩直通，关掉轮子就不出力）
+    declare_parameter("wheel_torque_enable", true);
     declare_parameter("wheel_torque_max", 0.40);
     declare_parameter("k_vel_p", 1.0);
     declare_parameter("k_yaw_p", 0.15);
@@ -408,7 +408,7 @@ private:
       throw std::invalid_argument("轮速映射系数和轮速限幅必须有限且为正");
     }
 
-    // 轮子力矩前馈通道（可选，默认关）
+    // 轮子力矩通道（实机主通道，默认开）
     cfg.wheel_torque_enable = get("wheel_torque_enable").as_bool();
     cfg.wheel_torque_max = get("wheel_torque_max").as_double();
     cfg.k_vel_p = get("k_vel_p").as_double();
@@ -492,18 +492,20 @@ private:
       cfg.safety.command_timeout, cfg.safety.command_fault_timeout);
     RCLCPP_INFO(
       get_logger(),
-      "轮子主通道：/wheel_target（速度，固件位置+速度双环），轮距 %.3f m，"
-      "平衡折算 %.2f rad/s/N·m，差速限幅 %.1f / 总限幅 %.1f rad/s",
-      cfg.wheel_separation, cfg.balance_torque_to_omega, cfg.max_drive_omega,
+      "轮子主通道：/wheel_torque（力矩直通，%.1f N·m/轮），轮距 %.3f m，"
+      "平衡折算 %.2f rad/s/N·m，差速限幅 %.1f / 总限幅 %.1f rad/s（/wheel_target 仅仿真）",
+      cfg.wheel_torque_max, cfg.wheel_separation, cfg.balance_torque_to_omega, cfg.max_drive_omega,
       cfg.max_wheel_omega);
     if (cfg.wheel_torque_enable) {
       RCLCPP_INFO(
         get_logger(),
-        "轮子力矩前馈：开，上限 %.2f N·m，k_vel_p=%.2f，k_yaw_p=%.2f，yaw_ff=%.2f，"
-        "制动阻尼 %.3f",
+        "轮子力矩通道：开（实机主通道），上限 %.2f N·m，k_vel_p=%.2f，k_yaw_p=%.2f，"
+        "yaw_ff=%.2f，制动阻尼 %.3f",
         cfg.wheel_torque_max, cfg.k_vel_p, cfg.k_yaw_p, cfg.yaw_ff, cfg.wheel_brake_damp);
     } else {
-      RCLCPP_INFO(get_logger(), "轮子力矩前馈：关（/wheel_torque 恒为 0，执行全在固件 PID 双环）");
+      RCLCPP_WARN(
+        get_logger(),
+        "轮子力矩通道：关（/wheel_torque 恒为 0）。固件是纯力矩直通，实机轮子将完全不出力");
     }
   }
 
@@ -728,9 +730,9 @@ private:
     joint_target_pub_->publish(
       leg_calc::makeJointTarget(
         controller_.config().leg_joint_names, snapshot, output, stamp));
+    // /wheel_target 只给仿真桥与调试观测（实机固件不读 angle/omega）
     wheel_target_pub_->publish(leg_calc::makeWheelTarget(output));
-    // 力矩前馈单独走一路：默认关闭（wheel_torque_enable=false 时恒为 0），
-    // 打开后固件把它加到速度环输出上，主通道仍是上面的 /wheel_target
+    // 实机主通道：/wheel_torque → 帧里 wheel[].torque → 固件乘 WHEEL_COUNTS_PER_NM 变电流
     const leg_calc::ControllerConfig & cfg_now = controller_.config();
     const double force_to_torque =
       (cfg_now.model.input_mode == leg_calc::InputMode::kForce) ?

@@ -4,8 +4,8 @@
  * 唯一的实机通信出口，只做“搬运”，不做任何控制计算：
  *
  * 下行：按 send_rate 周期发送 RobotTarget_t（104 B）
- *   wheel[0..1] : wheel_target（[ω_L, ω_R]）→ 速度环参考 + 积分出的位置环目标；
- *                 wheel_torque（[τ_L, τ_R]）→ 可选力矩前馈（wheel_torque_gain，默认 0）
+ *   wheel[0..1] : wheel_torque（[τ_L, τ_R]）→ 力矩直通（wheel_torque_gain，实机必须 1.0）；
+ *                 wheel_target（[ω_L, ω_R]）→ 只填 angle/omega 保留字段（固件已不读）
  *   joint[0..3] : 由 joint_target（sensor_msgs/JointState）的 4 个腿关节 + 参数 kp/kd 组成
  * 上行：解析 RobotState_t（208 B，固件 100 Hz 上报）
  *   wheel[0..1] : M2006 轮子角度/角速度
@@ -14,15 +14,15 @@
  * 注意：固件按结构体裸内存收发，没有包头和长度字段，因此上位机必须按固定长度拆帧；
  *       USB bulk 可能出现粘包/拆包，这里用累积缓冲区重组。
  *
- * 频率：默认 200 Hz 下发（下位机控制环 333 Hz、状态上报 100 Hz）。
+ * 频率：默认 200 Hz 下发（下位机控制环 250 Hz、状态上报 100 Hz）。
  * 三重兜底：
- *   ① 控制指令超时（command_timeout）→ 轮子位置保持、关节失力
+ *   ① 控制指令超时（command_timeout）→ 轮子力矩置 0（失力）、关节失力
  *   ② 状态帧超时（state_timeout）→ 立即改发安全帧，不再下发过期指令
  *   ③ 节点退出 → 再发一帧安全帧
  *
  * 话题：
- *   订阅 wheel_target    (Float64MultiArray, [左, 右])  —— 轮速目标 [rad/s]（实机主通道）
- *   订阅 wheel_torque    (Float64MultiArray, [左, 右])  —— 轮轴力矩 [N*m]（可选前馈，默认关）
+ *   订阅 wheel_target    (Float64MultiArray, [左, 右])  —— 轮速目标 [rad/s]（实机不生效，仅填保留字段）
+ *   订阅 wheel_torque    (Float64MultiArray, [左, 右])  —— 轮轴力矩 [N*m]（实机主通道）
  *   订阅 joint_target    (sensor_msgs/JointState)       —— 4 个腿关节目标（effort=力矩）
  *   （不发布 odom：里程计由 leg_control 用本节点上报的轮端数据换算）
  *   发布 joint_states    (sensor_msgs/JointState)       —— 2 轮 + 4 关节反馈
@@ -174,10 +174,10 @@ public:
 
     max_wheel_torque_ = declare_parameter("max_wheel_torque", 1.0);
     // /wheel_torque → 帧里 wheel[i].torque 的缩放。
-    // 固件已恢复轮子"位置外环 + 速度内环"的双环 PID：实机执行通道是 /wheel_target，
-    // 帧里的 torque 只是叠加在速度环输出上的**力矩前馈**，所以默认 0（关）。
-    // 只有想额外加平衡前馈时才置 1.0，并把 leg_control 的 wheel_torque_enable 一起打开。
-    wheel_torque_gain_ = declare_parameter("wheel_torque_gain", 0.0);
+    // 固件 wheel_control_task 是**纯力矩直通**（无位置/速度环，只读 wheel[].torque），
+    // 所以这是实机唯一的轮子执行通道，默认必须 1.0；置 0 等于轮子完全不出力。
+    // 同时要把 leg_control 的 wheel_torque_enable 打开（否则 /wheel_torque 恒为 0）。
+    wheel_torque_gain_ = declare_parameter("wheel_torque_gain", 1.0);
 
     const std::string wheel_target_topic =
       declare_parameter("wheel_target_topic", std::string("wheel_target"));
@@ -239,7 +239,7 @@ public:
       sizeof(usb_drive::RobotState_t), send_rate_);
     RCLCPP_INFO(
       get_logger(),
-      "轮子执行通道: 固件位置+速度双环（/wheel_target 生效）；力矩前馈 gain=%.2f（0 = 关）",
+      "轮子执行通道: 固件力矩直通（主通道 /wheel_torque）；力矩 gain=%.2f（0 = 轮子不出力）",
       wheel_torque_gain_);
   }
 
@@ -464,12 +464,12 @@ private:
         if (!wheel_fresh && wheel_angle_init_) {
           RCLCPP_WARN_THROTTLE(
             get_logger(), *get_clock(), 2000,
-            "轮速指令中断超过 %.3f s，轮子改为位置保持（ω 参考归零）",
+            "轮速指令中断超过 %.3f s，停止积分保留字段 angle/omega（轮子力矩不受影响）",
             command_timeout_);
           wheel_angle_init_ = false;
         }
 
-        // 可选力矩前馈：/wheel_torque（[τ_L, τ_R]，N·m）→ 固件加到速度环输出上；超时即归零
+        // 主通道：/wheel_torque（[τ_L, τ_R]，N·m）→ 固件乘 WHEEL_COUNTS_PER_NM 变电流；超时即归零
         const bool torque_fresh =
           wheel_torque_received_ &&
           (stamp - last_wheel_torque_time_).seconds() <= command_timeout_;
@@ -482,16 +482,13 @@ private:
           double omega_cmd = 0.0;
           double torque_cmd = 0.0;
 
+          // angle/omega 是协议保留字段（固件已不读），仍按 ω 目标积分填好，
+          // 便于抓帧对照；仿真桥走的是另一条链路，不依赖这里。
           if (wheel_fresh) {
             omega_cmd = std::clamp(wheel_target_speed_[i], -max_wheel_omega_, max_wheel_omega_);
             if (!wheel_angle_init_ || omega_cmd == 0.0) {
-              // 两种情况下把位置目标重新锚到"当前实测角"：
-              //   1) 首次进入闭环，避免角度指令突变；
-              //   2) 上位机给的速度目标是 0（未使能 / FAULT / 停车）。
-              // 第 2 条很关键：固件的位置环是绝对角保持，如果目标角一直冻在"上一次
-              // 运动结束时的值"，轮子被推着转（或故障前还在滚）就会积累角度误差，
-              // 位置环反过来把轮子拽回旧角度 —— 表现为停机后轮子自己往回倒。
-              // 每次锚到实测角 = 误差恒 0，位置环不出力，只留速度环把 ω 稳到 0。
+              // 速度目标为 0（未使能 / FAULT / 停车）时把角度目标重新锚到实测角，
+              // 避免保留字段长期累积出无意义的几圈偏差
               wheel_angle_target_[i] = measured_wheel_angle_[i];
               wheel_angle_init_ = true;
             }
@@ -499,8 +496,7 @@ private:
             angle_cmd = wheel_angle_target_[i];
           }
           if (torque_fresh && wheel_torque_gain_ != 0.0) {
-            // 默认 gain=0：轮子只由下位机双环 PID 控制（与改动前行为一致）；
-            // 想叠加平衡力矩前馈时把 wheel_torque_gain 设成 1.0
+            // 默认 gain=1.0：这是实机唯一的轮子执行通道（固件纯力矩直通）
             torque_cmd = std::clamp(
               wheel_torque_gain_ * wheel_torque_[i], -max_wheel_torque_, max_wheel_torque_);
           }
@@ -534,10 +530,10 @@ private:
     cdc_->sendStruct(target);
   }
 
-  /// 组装安全帧：轮子锁在当前角度（位置保持），关节全部失力，力矩前馈置 0
+  /// 组装安全帧：轮子力矩置 0（失力），关节全部失力，保留字段填实测角/零速
   ///
-  /// 固件是位置外环 + 速度内环的双环 PID：angle = 实测角、omega = 0 就等于"锁住不动"，
-  /// 不再需要（也不该要）用 τ = −k·ω 的阻尼项去制动 —— 力矩前馈会和位置环互相顶。
+  /// 固件是纯力矩直通、没有位置环：torque = 0 就等于轮子自由（坡上会溜车），
+  /// 想制动得填 τ = −k·ω（见 leg_control 的 wheel_brake_damp）。
   /// 调用方必须已持有 data_mutex_
   void fillSafeFrame(usb_drive::RobotTarget_t * safe) const
   {
@@ -594,9 +590,9 @@ private:
   bool wheel_target_received_{false};
   rclcpp::Time last_wheel_target_time_{0, 0, RCL_ROS_TIME};
 
-  // 力矩前馈分量 [N*m]（固件把它加到速度环输出上；gain=0 时不参与）
+  // 力矩分量 [N*m]（固件纯力矩直通，这是实机唯一的轮子执行通道；gain=0 时不参与）
   double wheel_torque_[2]{0.0, 0.0};
-  double wheel_torque_gain_{0.0};
+  double wheel_torque_gain_{1.0};
   double max_wheel_torque_{1.0};
   bool wheel_torque_received_{false};
   rclcpp::Time last_wheel_torque_time_{0, 0, RCL_ROS_TIME};

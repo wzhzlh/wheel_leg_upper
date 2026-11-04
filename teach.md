@@ -585,7 +585,7 @@ ros2 param set /leg_control q_diag "[20.0, 2000.0, 1.0, 1.0]"
 "要求 0.9° 内就回到零"，执行器做不到，于是全程 bang-bang。**判据**：正常站立时
 `/leg_control/state[6]`（即 `u`）应接近 0；长期贴边就把 K 整体缩小（或增大 `r_weight`）。
 
-本仓库现在用 `gain_mode: quadratic` + `k_coeffs` 只填常数项，把这个 1/6 增益直接写死：
+本仓库现在用 `gain_mode: quadratic` + `k_coeffs` 只填常数项。下面是历史调参记录；当前参数以 `src/leg_calc/config/leg_control_params.yaml` 为准：
 
 ```yaml
 gain_mode: quadratic
@@ -594,7 +594,7 @@ k_coeffs: [0.0,0.0,-1.18,  0.0,0.0,-4.52,  0.0,0.0,-1.16,  0.0,0.0,-0.28]
 
 ### 6.4 `u_max` 与饱和
 
-`u_max`（默认 0.40 N·m）是平衡力矩硬限幅，取值来自轮地摩擦上限（`μ·N·r ≈ 0.4`，再大只会打滑、
+`u_max`（当前 0.80 N·m）是两轮合计平衡力矩硬限幅，每轮取 `u/2`，单轮仍受 `wheel_torque_max=0.40 N·m` 约束。单轮限幅来自轮地摩擦上限（`μ·N·r ≈ 0.4`，再大只会打滑、
 让里程计失真），不是电机上限（MJCF/实机轮子都有 3 N·m 的余量）。若 `/leg_control/state` 里的 `u` 长期贴边，说明：
 - θ 零位没标定（最常见）；
 - 增益过大（Q 太大/R 太小）；
@@ -736,14 +736,14 @@ sudo udevadm control --reload-rules && sudo udevadm trigger
 |---|---|---|
 | 频率 | `control_rate` / `debug_rate` | 500 Hz / **100 Hz**（`/odom` + TF + `/leg_control/state` 的发布频率，0 = 不发） |
 | 模型 | `cart_mass` / `pendulum_mass` / `com_length` / `com_inertia` / `wheel_radius` / `wheel_inertia` | 0.285 / 1.904 / **0.0343** / **0.001793** / 0.030 / **4.213e-5**（URDF/MJCF 实测，见 6.1） |
-| 权重 | `q_diag` / `r_weight` | [50, 500, 10, 1] / 1.0（`quadratic` 模式下不参与计算，只作参考） |
-| 增益 | `gain_mode` / `k_coeffs` / `h_min` / `h_max` | quadratic / `[−1.18, −4.52, −2.00, −0.28]` 的常数项（LQR 的 1/6，见 6.3；`k_x_dot` 上限 ≈2.1，见 12.13）/ 0.06 / 0.12；`online_lqr` 仍可用，k_coeffs 全零即退回 |
+| 权重 | `q_diag` / `r_weight` | [100, 900, 25, 0] / 1.0（`quadratic` 模式下不参与计算） |
+| 增益 | `gain_mode` / `k_coeffs` / `h_min` / `h_max` | quadratic / `[−1.18, −4.52, −2.00, −0.40]` 的常数项 / 0.06 / 0.12；启动校验包含速度 P 和轮力矩低通 |
 | 高度 | `com_height_default` / `_min` / `_max` / `com_offset` / `use_measured_height` | 0.0834 / 0.065 / 0.100 / **-0.0289** m / true |
-| 平衡 | `theta_axis` / `theta_offset` / `u_max` | pitch / 0.0 / 0.40 N·m |
+| 平衡 | `theta_axis` / `theta_offset` / `u_max` | pitch / 0.0 / 0.80 N·m（两轮合计，每轮 `u/2`） |
 | VMC | `l1..l5` / `kp_x,kp_y` / `kd_x,kd_y` / `force_max_*` / `joint_torque_max` / `joint_torque_sign` | 见第 9 章 |
 | 关节角标定 | `joint_sign` / `joint_offset`（4 个数，α/β = sign·q + offset） | 见 12.7 |
 | 高度斜坡 | `com_height_rate` | 0.30 m·s⁻¹ |
-| 轮子 | `wheel_torque_max` / `k_vel_p` / `k_yaw_p` / `wheel_brake_damp` / `yaw_ff` / `k_vel_i` / `k_yaw_i`（力矩通道） | 0.40 / **1.0** / **0.15** / **0.02** / **0.06** / **0.0（关）** / **0.0（关）** |
+| 轮子 | `wheel_torque_max` / `k_vel_p` / `k_yaw_p` / `wheel_brake_damp` / `yaw_ff` / `k_vel_i` / `k_yaw_i`（力矩通道） | 0.40 / **0.0** / **0.0** / **0.02** / **0.06** / **0.0（关）** / **0.0（关）** |
 | 轮子（仅 `/wheel_target` 速度通道 = 仿真） | `wheel_radius` / `max_wheel_omega` / `max_balance_omega` / `max_yaw_rate` / `k_yaw` / `wheel_damp_ff` / `balance_torque_to_omega` / `balance_leak_rate` | 0.03 / 20 / 8 / **3.0（仿真 launch 覆盖成 0.20，见 12.13）** / 0.0 / **0.016** / **1.0** / 60 s⁻¹ |
 | 安全 | `imu_timeout` / `joint_state_timeout` / `command_timeout` / `command_fault_timeout` / `max_pitch` / `max_pitch_rate` / `startup_cycles` | 0.10 / 0.10 / 0.30 / 1.00 s / **0.35 rad（20°）** / **3.0** / 250 |
 | 话题 | `imu_topic` / `joint_states_topic` / `command_topic` / `joint_target_topic` / `wheel_target_topic` / `wheel_torque_topic` / `odom_topic` | imu/data / joint_states / robot_command / joint_target / wheel_target / wheel_torque / odom |
@@ -1111,11 +1111,11 @@ v = (ω_L + ω_R)·r / 2
 **实机主链路是力矩域**（固件 `wheel_control_task` 已删除位置/速度环，只做 `N·m → 电流`）：
 
 ```
-u        = −K(x − x_ref)                                    ① Pitch LQR，单位 N·m，限幅 ±u_max
+u        = −K(x − x_ref)                                    ① Pitch LQR，两轮合计 N·m，限幅 ±u_max
 τ_v      = k_vel_p·(v_d − ẋ) [+ k_vel_i·∫ …]                ② 速度误差 P(+I)，左右同相
 τ_yaw    = yaw_ff·ω_d + k_yaw_p·(ω_d − ω) [+ k_yaw_i·∫ …]   ③ 偏航误差 P(+I) + 角速度前馈
-τ_L      = clamp(u + τ_v − τ_yaw, ±wheel_torque_max)        ④ 左轮
-τ_R      = clamp(u + τ_v + τ_yaw, ±wheel_torque_max)        ⑤ 右轮
+τ_L      = clamp(u/2 + τ_v − τ_yaw, ±wheel_torque_max)      ④ 左轮
+τ_R      = clamp(u/2 + τ_v + τ_yaw, ±wheel_torque_max)      ⑤ 右轮
 → /wheel_torque → 帧 wheel[i].torque → 固件 τ × WHEEL_COUNTS_PER_NM → 0x200 电流
 ```
 
@@ -1126,7 +1126,7 @@ u        = −K(x − x_ref)                                    ① Pitch LQR，
 - **非平衡态**（未使能 / FAULT / 命令长期丢失）：`τ_L = τ_R = −wheel_brake_damp·ω`，阻尼制动。
   `usb_drive` 侧还有一层兜底：状态帧超时（`state_timeout`）时按 `τ = −safe_damp_torque·ω` 发安全帧。
   两者都不是"位置保持"，坡上会有缓慢溜车。
-- **限幅链**：`u_max`（平衡分量）→ `wheel_torque_max`（单轮总力矩，默认 0.40 ≈ 轮地摩擦上上限）
+- **限幅链**：`u_max`（两轮合计平衡分量）→ 每轮 `u/2` → `wheel_torque_max`（单轮总力矩，默认 0.40 ≈ 轮地摩擦上限）
   → `usb_drive` 的 `max_wheel_torque` 与固件的 `WHEEL_CUR_MAX_CMD`。速度通道的
   `max_balance_omega / max_wheel_omega` 只在 `/wheel_target` 上有意义。
 

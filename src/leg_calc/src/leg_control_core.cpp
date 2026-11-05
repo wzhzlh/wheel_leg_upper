@@ -384,9 +384,9 @@ std::array<double, 2> LegController::computeWheelTorques(
 
   // 正偏航 = 左转：右轮 +τ_yaw、左轮 −τ_yaw（两轮在世界系里是同一转向方向）
   tau_ref[0] = std::clamp(
-    u + tau_vel - tau_yaw, -config_.wheel_torque_max, config_.wheel_torque_max);
+    0.5 * u + tau_vel - tau_yaw, -config_.wheel_torque_max, config_.wheel_torque_max);
   tau_ref[1] = std::clamp(
-    u + tau_vel + tau_yaw, -config_.wheel_torque_max, config_.wheel_torque_max);
+    0.5 * u + tau_vel + tau_yaw, -config_.wheel_torque_max, config_.wheel_torque_max);
 
   // 一阶低通（沿用 balance_leak_rate）：500 Hz 力矩直通会把腿部/俯仰的 ~10 Hz 谐振激励起来，
   // 表现为 pitch_rate ±2 rad/s 的极限环。速度通道本来就被这条滤波平滑过，力矩通道也要一致。

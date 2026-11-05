@@ -32,6 +32,12 @@ class YbImuDriver(Node):
 
         self.robot = None
         self._gyro_zero_frames = 0
+        # 陀螺丢帧保持：模块偶尔会在 RAW 帧里给出三轴全 0 的角速度
+        # （2026-11-04 实测 12 s 内 31% 的帧），而同帧加速度正常。
+        # θ̇ 直接取 angular_velocity.y 做阻尼，归零会让 LQR 的 k_θdot 项周期性失效，
+        # 表现为“刚度够但修正慢/前后摆”。三轴恰好同时为 0 视为丢帧，沿用上一帧有效值。
+        self._last_gyro = (0.0, 0.0, 0.0)
+        self._gyro_hold_limit = 50          # ≈0.5 s @100 Hz，超过就认为真的没数据
         self.frame_id = self.get_parameter("frame_id").value
         self.orientation_stddev = float(
             self.get_parameter("orientation_stddev").value)
@@ -98,19 +104,23 @@ class YbImuDriver(Node):
         imu.linear_acceleration.x = float(ax)
         imu.linear_acceleration.y = float(ay)
         imu.linear_acceleration.z = float(az)
-        imu.angular_velocity.x = float(gx)
-        imu.angular_velocity.y = float(gy)
-        imu.angular_velocity.z = float(gz)
 
-        # 陀螺仪健康检查：加速度有值但三轴角速度连续为 0，说明模块没在输出陀螺数据。
+        # 陀螺仪健康检查：加速度有值但三轴角速度恰好全为 0，说明这一帧没有陀螺数据。
         # 此时 θ̇ 阻尼项与偏航闭环全部失效（表现为"刚度够但修正慢"）。
         if gx == 0.0 and gy == 0.0 and gz == 0.0:
             self._gyro_zero_frames += 1
+            if self._gyro_zero_frames >= self._gyro_hold_limit:
+                self._last_gyro = (0.0, 0.0, 0.0)   # 持续丢帧 → 不再伪装，如实输出 0
             if self._gyro_zero_frames == 300:   # ≈3 s @100 Hz
                 self.get_logger().warn(
                     "IMU 角速度连续为 0：陀螺仪未输出数据，θ̇ 阻尼与偏航闭环会失效")
         else:
             self._gyro_zero_frames = 0
+            self._last_gyro = (gx, gy, gz)
+
+        imu.angular_velocity.x = float(self._last_gyro[0])
+        imu.angular_velocity.y = float(self._last_gyro[1])
+        imu.angular_velocity.z = float(self._last_gyro[2])
 
         variance = self.orientation_stddev ** 2
         imu.orientation.w = float(qw)
